@@ -209,20 +209,57 @@ class LoadVideo(DataProcessingOperator, FrameSamplerByRateMixin):
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
 
+    def load_with_cv2(self, data: str, imageio_error: Exception):
+        try:
+            import cv2
+        except Exception as cv2_import_error:
+            raise RuntimeError(f"Failed to read video with imageio: {imageio_error}") from cv2_import_error
+
+        capture = cv2.VideoCapture(str(data))
+        try:
+            if not capture.isOpened():
+                raise RuntimeError(f"cv2 failed to open {data}") from imageio_error
+            raw_frame_rate = float(capture.get(cv2.CAP_PROP_FPS) or self.frame_rate)
+            total_raw_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            num_frames = self.num_frames
+            if total_raw_frames < num_frames:
+                num_frames = total_raw_frames
+                while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
+                    num_frames -= 1
+            frames = []
+            for frame_id in range(num_frames):
+                frame_id = self.map_single_frame_id(frame_id, raw_frame_rate, total_raw_frames)
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+                ok, frame = capture.read()
+                if not ok:
+                    raise RuntimeError(f"cv2 failed to read frame {frame_id} from {data}") from imageio_error
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = Image.fromarray(frame)
+                frame = self.frame_processor(frame)
+                frames.append(frame)
+            return frames
+        finally:
+            capture.release()
+
     def __call__(self, data: str):
-        reader = self.get_reader(data)
-        raw_frame_rate = reader.get_meta_data()['fps']
-        num_frames = self.get_num_frames(reader)
-        total_raw_frames = reader.count_frames()
-        frames = []
-        for frame_id in range(num_frames):
-            frame_id = self.map_single_frame_id(frame_id, raw_frame_rate, total_raw_frames)
-            frame = reader.get_data(frame_id)
-            frame = Image.fromarray(frame)
-            frame = self.frame_processor(frame)
-            frames.append(frame)
-        reader.close()
-        return frames
+        try:
+            reader = self.get_reader(data)
+            raw_frame_rate = reader.get_meta_data()['fps']
+            num_frames = self.get_num_frames(reader)
+            total_raw_frames = reader.count_frames()
+            frames = []
+            for frame_id in range(num_frames):
+                frame_id = self.map_single_frame_id(frame_id, raw_frame_rate, total_raw_frames)
+                frame = reader.get_data(frame_id)
+                frame = Image.fromarray(frame)
+                frame = self.frame_processor(frame)
+                frames.append(frame)
+            return frames
+        except Exception as exc:
+            return self.load_with_cv2(data, exc)
+        finally:
+            if "reader" in locals():
+                reader.close()
 
 
 class SequencialProcess(DataProcessingOperator):

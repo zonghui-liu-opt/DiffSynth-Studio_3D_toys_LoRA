@@ -13,7 +13,7 @@
 
 ## 数据 schema
 
-- 猫咪动作：`video,prompt,input_image` 三列，`input_image` 指向独立首帧图。
+- 通用三列 TI2V：`video,prompt,input_image` 三列，`input_image` 指向独立首帧图。
 - 手办旋转：`video,prompt` 两列，`input_image` 由训练 forward 自动回退为视频第 0 帧。
 - 训练前仍建议运行 `check_dataset.py` 生成 `metadata_fixed.csv`，用于统一分隔符并补 `height,width,bucket`。
 
@@ -30,7 +30,7 @@
 ## 修改文件清单
 
 - 新增 `docs/calltrace_ti2v_lora.md`：训练、推理、TI2V 条件注入调用链。
-- 新增 `make_debug_dataset.py`：生成猫咪三列或手办两列离线调试数据。
+- 新增 `make_debug_dataset.py`：生成通用三列或手办两列离线调试数据。
 - 修改 `check_dataset.py`：自动识别两列/三列 schema，两列时校验视频第 0 帧可解码。
 - 新增 `train_figurine360_lora.sh`：手办两列 metadata 的 Stage B 训练入口。
 - 新增 `infer_figurine360.py`：手办 LoRA 推理入口，支持 `--dry_run`。

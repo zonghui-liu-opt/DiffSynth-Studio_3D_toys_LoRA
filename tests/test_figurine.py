@@ -124,8 +124,8 @@ def test_two_col_training_input_image_falls_back_to_video_first_frame(tmp_path):
     assert inputs["input_image"] is sample["video"][0]
 
 
-def test_three_col_debug_dataset_keeps_input_images_for_cat_regression(tmp_path):
-    dataset_root = tmp_path / "debug_data_cats"
+def test_three_col_debug_dataset_keeps_input_images_for_three_col_regression(tmp_path):
+    dataset_root = tmp_path / "debug_data_three_col"
     run_make_debug_dataset(dataset_root, "--schema", "three_col")
 
     with (dataset_root / "metadata.csv").open(newline="", encoding="utf-8") as handle:

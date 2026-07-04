@@ -17,12 +17,12 @@
 
 ## 本地 Wan2.2-TI2V-5B LoRA 任务
 
-本仓库当前维护两条基于 Wan2.2-TI2V-5B 的 LoRA SFT 上机链路，二者共用底模权重、`check_dataset.py`、`metrics_utils.py`、`plot_metrics.py` 和 DiffSynth 原生 trainer。
+本仓库当前聚焦基于 Wan2.2-TI2V-5B 的 3D 玩偶 360 度水平旋转 LoRA SFT 上机链路，同时保留可复用的三列 TI2V 数据工具、指标工具和 DiffSynth 原生 trainer。
 
 | 特性 | 数据 schema | 训练入口 | 推理入口 | 说明 |
 |-|-|-|-|-|
-| 猫咪动作视频 | `video,prompt,input_image` 三列 | `train_ti2v5b_lora.sh` | `infer_cats_ti2v5b_lora.py` | `input_image` 指向独立首帧图。 |
 | 手办 360 度水平旋转 | `video,prompt` 两列 | `train_figurine360_lora.sh` | `infer_figurine360.py` | `input_image` 由 trainer 自动回退为视频第 0 帧。 |
+| 通用三列 TI2V LoRA | `video,prompt,input_image` 三列 | `train_ti2v5b_lora.sh` | 按任务自备 | `input_image` 指向独立首帧图。 |
 
 手办任务的调用链和上机 checklist 见 `docs/calltrace_ti2v_lora.md` 与 `NOTES_figurine.md`。LoRA 输出目录互相独立；底模目录仍要求包含 `diffusion_pytorch_model*.safetensors`、`models_t5_umt5-xxl-enc-bf16.pth`、`Wan2.2_VAE.pth` 和 `google/umt5-xxl/`。
 

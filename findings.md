@@ -21,7 +21,7 @@
 - 当前 Mac CPU 测试可直接 import `UnifiedDataset`，并通过 orientation bucket 单测覆盖图片路径加载、`input_image` 加载和 metadata 处理。
 - 当前 DataLoader 使用 `collate_fn=lambda x: x[0]`，每个 micro-step 实际仍是单样本 forward；因此横竖屏 bucket 支持应优先保持现有训练语义，不直接改成 dense tensor batch。
 - 横屏 `480x832` 与竖屏 `832x480` token 数相同；metrics 继续用横屏 `height,width` 计算 tokens 不影响吞吐统计。
-- `ImageCropAndResize` 会 scale 后 center crop，不适合把竖屏猫视频强制转为横屏训练；新增 no-crop orientation resize 比修改旧算子更稳妥。
+- `ImageCropAndResize` 会 scale 后 center crop，不适合把竖屏视频强制转为横屏训练；新增 no-crop orientation resize 比修改旧算子更稳妥。
 
 ## 技术决策
 | 决策 | 理由 |

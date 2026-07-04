@@ -7,12 +7,12 @@
 - 执行的操作：
   - 创建 `log.txt` 记录修改及作用。
   - 将 `NOTES.md` 改为中文简要内网上机说明。
-  - 创建 `train_cats_sft_lora.md` 记录猫视频 LoRA 内网冒烟和正式训练命令。
+  - 创建三列 TI2V LoRA 内网冒烟和正式训练命令记录。
   - 在 `.gitignore` 中添加 `!log.txt`，避免 `log*.txt` 规则忽略该文件。
 - 创建/修改的文件：
   - `log.txt`
   - `NOTES.md`
-  - `train_cats_sft_lora.md`
+  - `NOTES.md`
   - `.gitignore`
 
 ### 清理本地调试文件
@@ -41,7 +41,7 @@
   - 新增 `OrientationBucketSampler`，训练时按 metadata bucket 分组采样。
   - `examples/wanvideo/model_training/train.py` 在 `--enable_orientation_buckets` 时启用 bucket/no-crop 数据处理。
   - `train_ti2v5b_lora.sh` 新增 `ENABLE_ORIENTATION_BUCKETS`，默认启用。
-  - 更新 `NOTES.md`、`train_cats_sft_lora.md`、`log.txt`。
+  - 更新 `NOTES.md`、`log.txt`。
 - 创建/修改的文件：
   - `tests/test_orientation_buckets.py`
   - `check_dataset.py`
@@ -54,7 +54,7 @@
   - `examples/wanvideo/model_training/train.py`
   - `train_ti2v5b_lora.sh`
   - `NOTES.md`
-  - `train_cats_sft_lora.md`
+  - `NOTES.md`
   - `log.txt`
 - 测试：
   - `pytest tests/test_orientation_buckets.py -v`：6 passed
@@ -72,12 +72,12 @@
   - 新增 launcher 静态测试，锁定 `SAVE_STEPS`、`SAVE_ARGS` 和 `--save_steps` 条件传参。
   - `train_ti2v5b_lora.sh` 顶部变量块新增 `SAVE_STEPS=${SAVE_STEPS:-}`。
   - 当 `SAVE_STEPS` 非空时，训练命令追加 `--save_steps "$SAVE_STEPS"`；为空时保持每 epoch 保存。
-  - 更新 `NOTES.md`、`train_cats_sft_lora.md`、`log.txt`。
+  - 更新 `NOTES.md`、`log.txt`。
 - 创建/修改的文件：
   - `tests/test_train_launcher.py`
   - `train_ti2v5b_lora.sh`
   - `NOTES.md`
-  - `train_cats_sft_lora.md`
+  - `NOTES.md`
   - `log.txt`
 - 测试：
   - `pytest tests/test_train_launcher.py -v`：1 passed

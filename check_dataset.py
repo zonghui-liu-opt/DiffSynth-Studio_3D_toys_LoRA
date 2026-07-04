@@ -145,11 +145,29 @@ def inspect_video(video_path):
 
 
 def decode_first_frame(video_path):
-    reader = imageio.get_reader(video_path)
     try:
-        reader.get_data(0)
+        reader = imageio.get_reader(video_path)
+        try:
+            reader.get_data(0)
+        finally:
+            reader.close()
+        return
+    except Exception:
+        pass
+
+    try:
+        import cv2
+    except Exception as exc:
+        raise RuntimeError("cv2 is not available") from exc
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        if not capture.isOpened():
+            raise RuntimeError(f"cv2 failed to open {video_path}")
+        ok, _ = capture.read()
+        if not ok:
+            raise RuntimeError(f"cv2 failed to decode first frame of {video_path}")
     finally:
-        reader.close()
+        capture.release()
 
 
 def validate_dataset(dataset_root, metadata_path, height, width, num_frames):

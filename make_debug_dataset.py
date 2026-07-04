@@ -70,7 +70,24 @@ def render_frame(width, height, frame_id, num_frames, sample_id, schema):
 def write_video(path, frames, fps):
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays = [np.asarray(frame) for frame in frames]
-    imageio.mimsave(path, arrays, fps=fps, macro_block_size=None)
+    try:
+        imageio.mimsave(path, arrays, fps=fps, macro_block_size=None)
+        return
+    except Exception as imageio_error:
+        try:
+            import cv2
+        except Exception as cv2_import_error:
+            raise RuntimeError(f"Failed to write video with imageio: {imageio_error}") from cv2_import_error
+
+        height, width = arrays[0].shape[:2]
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open cv2 VideoWriter for {path}") from imageio_error
+        try:
+            for frame in arrays:
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        finally:
+            writer.release()
 
 
 def write_metadata(path, fieldnames, rows):
@@ -97,7 +114,7 @@ def generate_dataset(output_dir, schema, num_samples, height, width, num_frames,
         prompt = (
             f"手办360度水平旋转展示，调试色块样本 {sample_id:03d}"
             if schema == "two_col"
-            else f"debug cat action sample {sample_id:03d}"
+            else f"debug three-column action sample {sample_id:03d}"
         )
         row = {"video": video_rel, "prompt": prompt}
         if schema == "three_col":

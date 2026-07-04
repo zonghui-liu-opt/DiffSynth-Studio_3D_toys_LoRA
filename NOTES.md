@@ -1,12 +1,12 @@
 # Wan2.2-TI2V-5B LoRA 内网上机说明
 
-本文件记录猫咪动作视频三列数据链路。手办 360 度水平旋转两列数据链路见 `NOTES_figurine.md`，训练入口是 `train_figurine360_lora.sh`，推理入口是 `infer_figurine360.py`。
+本文件记录通用三列 TI2V LoRA 数据链路。手办 360 度水平旋转两列数据链路见 `NOTES_figurine.md`，训练入口是 `train_figurine360_lora.sh`，推理入口是 `infer_figurine360.py`。
 
 ## 两条特性差异
 
 | 特性 | metadata schema | 训练脚本 | LoRA 输出 | 首帧条件图来源 |
 |-|-|-|-|-|
-| 猫咪动作 | `video,prompt,input_image` | `train_ti2v5b_lora.sh` | `./models/train/Wan2.2-TI2V-5B_lora` | 独立图片列 `input_image` |
+| 通用三列 TI2V | `video,prompt,input_image` | `train_ti2v5b_lora.sh` | `./models/train/Wan2.2-TI2V-5B_lora` | 独立图片列 `input_image` |
 | 手办 360 度水平旋转 | `video,prompt` | `train_figurine360_lora.sh` | `./models/train/Wan2.2-TI2V-5B_figurine360_lora` | trainer 自动取视频第 0 帧 |
 
 两条链路共用同一套底模权重、数据体检脚本、指标记录和绘图工具；LoRA 产物互相独立，不要混用输出目录。
@@ -130,7 +130,7 @@ python3 plot_metrics.py \
 
 ## 注意事项
 
-- 猫咪训练脚本显式传 `--data_file_keys "video,input_image"`。
+- 三列训练脚本显式传 `--data_file_keys "video,input_image"`。
 - 手办训练脚本显式传 `--data_file_keys "video"`，但仍传 `--extra_inputs "input_image"`；trainer 会在 metadata 无 `input_image` 列时回退为视频首帧。
 - 当前 DataLoader 每个 micro step 实际只取 1 条样本；bucket sampler 控制采样顺序和尺寸路径，不代表 dense tensor batch size > 1。
 - 指标里的 `samples_per_step = grad_accum * world_size`；横屏 `480x832` 和竖屏 `832x480` token 数相同。
@@ -168,7 +168,7 @@ pipe.load_lora(pipe.dit, "models/train/Wan2.2-TI2V-5B_lora/epoch-0.safetensors",
 input_image = Image.open("/path/to/dataset/images_480x832/example.jpg").convert("RGB").resize((832, 480))
 
 video = pipe(
-    prompt="一只猫在镜头前自然活动",
+    prompt="目标主体在镜头前自然运动",
     input_image=input_image,
     height=480,
     width=832,
