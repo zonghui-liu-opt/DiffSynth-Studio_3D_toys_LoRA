@@ -129,18 +129,3 @@ METRICS_PATH=$OUTPUT_ROOT/metrics.jsonl
 ------
 
 两点补充说明：一是 T1 我刻意设计成"先读源码再定分支"而非直接给答案——DiffSynth-Studio 迭代较快，训练 forward 中 `input_image` 是否默认回退视频首帧这类行为必须以你仓库当前 commit 为准，让 codex 定位到具体代码行比预设结论更可靠；二是分支 B（预处理抽首帧）被设为不支持时的首选，因为它把差异消化在数据层，训练代码零改动，最符合原任务"不重复造轮子、最小侵入"的原则。
-
-------
-
-Learn more:
-
-1. [inquiry for details of wan2.2 i2v lora training? · Issue #793 · modelscope/DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio/issues/793)
-2. [Inquiry regarding Full Training speed and First-frame color shift on Wan2.2 TI2V 5B · Issue #1195 · modelscope/DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio/issues/1195)
-3. [DiffSynth-Studio/examples/wanvideo/model_training/lora/Wan2.2-TI2V-5B.sh at main · modelscope/DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/wanvideo/model_training/lora/Wan2.2-TI2V-5B.sh)
-4. [Wan2.2 Fine-Tuning: Tailoring an Advanced Video Generation Model on a Single GPU — ROCm Blogs](https://rocm.blogs.amd.com/artificial-intelligence/finetuning-wan-part1/README.html)
-5. [DiffSynth-Studio/docs/en/Model_Details/LTX-2.md at main · modelscope/DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio/blob/main/docs/en/Model_Details/LTX-2.md)
-6. [GitHub - modelscope/DiffSynth-Studio: Enjoy the magic of Diffusion models! · GitHub](https://github.com/modelscope/DiffSynth-Studio)
-7. [Wan-AI/Wan2.2-I2V-A14B-Diffusers · Hugging Face](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers)
-8. [DiffSynth-Studio/docs/en/Model_Details/Wan.md at main · modelscope/DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio/blob/main/docs/en/Model_Details/Wan.md)
-9. [DiffSynth-Studio/examples/wanvideo/model_training/lora/Wan2.2-S2V-14B.sh at main · modelscope/DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/wanvideo/model_training/lora/Wan2.2-S2V-14B.sh)
-10. [DiffSynth-Studio/examples/wanvideo/model_training/full/Wan2.2-I2V-A14B.sh at main · modelscope/DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio/blob/main/examples/wanvideo/model_training/full/Wan2.2-I2V-A14B.sh)
