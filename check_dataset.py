@@ -10,12 +10,16 @@ import imageio.v2 as imageio
 from metrics_utils import tokens_per_sample
 
 
-REQUIRED_COLUMNS = ("video", "prompt", "input_image")
-FIXED_COLUMNS = REQUIRED_COLUMNS + ("height", "width", "bucket")
+BASE_COLUMNS = ("video", "prompt")
+THREE_COL_COLUMNS = ("video", "prompt", "input_image")
+SCHEMA_COLUMNS = {
+    "two_col": BASE_COLUMNS,
+    "three_col": THREE_COL_COLUMNS,
+}
 
 
 def detect_delimiter(metadata_path):
-    sample = Path(metadata_path).read_text(encoding="utf-8")[:4096]
+    sample = Path(metadata_path).read_text(encoding="utf-8-sig")[:4096]
     try:
         return csv.Sniffer().sniff(sample, delimiters=",\t").delimiter
     except csv.Error:
@@ -23,14 +27,25 @@ def detect_delimiter(metadata_path):
         return "\t" if "\t" in first_line else ","
 
 
-def read_metadata(metadata_path, delimiter):
-    with Path(metadata_path).open(newline="", encoding="utf-8") as handle:
+def detect_schema(fieldnames):
+    fieldnames = list(fieldnames or [])
+    missing = [column for column in BASE_COLUMNS if column not in fieldnames]
+    if missing:
+        raise ValueError(f"metadata missing required columns: {', '.join(missing)}")
+    return "three_col" if "input_image" in fieldnames else "two_col"
+
+
+def read_metadata_with_schema(metadata_path, delimiter):
+    with Path(metadata_path).open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle, delimiter=delimiter)
         rows = list(reader)
         fieldnames = reader.fieldnames or []
-    missing = [column for column in REQUIRED_COLUMNS if column not in fieldnames]
-    if missing:
-        raise ValueError(f"metadata missing required columns: {', '.join(missing)}")
+    schema = detect_schema(fieldnames)
+    return rows, schema
+
+
+def read_metadata(metadata_path, delimiter):
+    rows, _ = read_metadata_with_schema(metadata_path, delimiter)
     return rows
 
 
@@ -44,13 +59,17 @@ def bucket_resolution(bucket, landscape_height, landscape_width):
     return landscape_height, landscape_width
 
 
-def write_fixed_metadata(metadata_path, rows):
+def fixed_columns_for_schema(schema):
+    return SCHEMA_COLUMNS[schema] + ("height", "width", "bucket")
+
+
+def write_fixed_metadata(metadata_path, rows, schema):
     fixed_path = Path(metadata_path).with_name("metadata_fixed.csv")
     with fixed_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(FIXED_COLUMNS))
+        writer = csv.DictWriter(handle, fieldnames=list(fixed_columns_for_schema(schema)))
         writer.writeheader()
         for row in rows:
-            writer.writerow({column: row.get(column, "") for column in FIXED_COLUMNS})
+            writer.writerow({column: row.get(column, "") for column in fixed_columns_for_schema(schema)})
     return fixed_path
 
 
@@ -125,20 +144,27 @@ def inspect_video(video_path):
     raise RuntimeError("; ".join(errors))
 
 
+def decode_first_frame(video_path):
+    reader = imageio.get_reader(video_path)
+    try:
+        reader.get_data(0)
+    finally:
+        reader.close()
+
+
 def validate_dataset(dataset_root, metadata_path, height, width, num_frames):
     dataset_root = Path(dataset_root)
     metadata_path = Path(metadata_path)
     delimiter = detect_delimiter(metadata_path)
-    rows = read_metadata(metadata_path, delimiter)
+    rows, schema = read_metadata_with_schema(metadata_path, delimiter)
 
     bad_rows = []
     stats = []
     fixed_rows = []
     for row_id, row in enumerate(rows):
         reasons = []
-        fixed_row = {column: row[column] for column in REQUIRED_COLUMNS}
+        fixed_row = {column: row[column] for column in SCHEMA_COLUMNS[schema]}
         video_path = dataset_root / row["video"]
-        image_path = dataset_root / row["input_image"]
         video_stats = None
         if not video_path.exists():
             reasons.append("missing_video")
@@ -150,8 +176,15 @@ def validate_dataset(dataset_root, metadata_path, height, width, num_frames):
                     reasons.append("insufficient_frames")
             except Exception as exc:
                 reasons.append(f"video_read_error:{exc}")
-        if not image_path.exists():
-            reasons.append("missing_input_image")
+            if schema == "two_col" and video_stats is not None:
+                try:
+                    decode_first_frame(video_path)
+                except Exception as exc:
+                    reasons.append(f"first_frame_decode_error:{exc}")
+        if schema == "three_col":
+            image_path = dataset_root / row["input_image"]
+            if not image_path.exists():
+                reasons.append("missing_input_image")
         if video_stats is not None:
             bucket = orientation_bucket(video_stats["height"], video_stats["width"])
             target_height, target_width = bucket_resolution(bucket, height, width)
@@ -160,13 +193,14 @@ def validate_dataset(dataset_root, metadata_path, height, width, num_frames):
         if reasons:
             bad_rows.append({"row": row_id, "video": row["video"], "reasons": reasons})
 
-    fixed_path = write_fixed_metadata(metadata_path, fixed_rows)
+    fixed_path = write_fixed_metadata(metadata_path, fixed_rows, schema)
     resolution_counts = Counter((item["height"], item["width"]) for item in stats)
     frame_counts = Counter(item["frames"] for item in stats)
     fps_counts = Counter(round(item["fps"], 3) for item in stats)
     bucket_counts = Counter(orientation_bucket(item["height"], item["width"]) for item in stats)
     token_count = tokens_per_sample(num_frames=num_frames, height=height, width=width)
     return {
+        "schema": schema,
         "delimiter": "tab" if delimiter == "\t" else "comma",
         "fixed_path": str(fixed_path),
         "total_rows": len(rows),
@@ -186,6 +220,7 @@ def validate_dataset(dataset_root, metadata_path, height, width, num_frames):
 
 def print_summary(summary):
     reason_counts = Counter(reason for row in summary["bad_rows"] for reason in row["reasons"])
+    print(f"schema: {summary['schema']}")
     print(f"delimiter: {summary['delimiter']}")
     print(f"metadata_fixed_path: {summary['fixed_path']}")
     print(f"total_rows: {summary['total_rows']}")

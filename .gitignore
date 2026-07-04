@@ -3,6 +3,7 @@
 /scripts
 /diffusers
 /debug_data
+/debug_data_figurine
 /.vscode
 /.opencode
 *.jsonl

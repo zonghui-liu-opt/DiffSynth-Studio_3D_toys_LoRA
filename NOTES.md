@@ -1,5 +1,16 @@
 # Wan2.2-TI2V-5B LoRA 内网上机说明
 
+本文件记录猫咪动作视频三列数据链路。手办 360 度水平旋转两列数据链路见 `NOTES_figurine.md`，训练入口是 `train_figurine360_lora.sh`，推理入口是 `infer_figurine360.py`。
+
+## 两条特性差异
+
+| 特性 | metadata schema | 训练脚本 | LoRA 输出 | 首帧条件图来源 |
+|-|-|-|-|-|
+| 猫咪动作 | `video,prompt,input_image` | `train_ti2v5b_lora.sh` | `./models/train/Wan2.2-TI2V-5B_lora` | 独立图片列 `input_image` |
+| 手办 360 度水平旋转 | `video,prompt` | `train_figurine360_lora.sh` | `./models/train/Wan2.2-TI2V-5B_figurine360_lora` | trainer 自动取视频第 0 帧 |
+
+两条链路共用同一套底模权重、数据体检脚本、指标记录和绘图工具；LoRA 产物互相独立，不要混用输出目录。
+
 ## 权重目录
 
 `MODEL_ROOT` 下必须有：
@@ -119,8 +130,8 @@ python3 plot_metrics.py \
 
 ## 注意事项
 
-- 当前训练脚本显式传 `--data_file_keys "video,input_image"`。
-- trainer 会优先使用 metadata 中的 `input_image`；没有该列时回退为视频首帧。
+- 猫咪训练脚本显式传 `--data_file_keys "video,input_image"`。
+- 手办训练脚本显式传 `--data_file_keys "video"`，但仍传 `--extra_inputs "input_image"`；trainer 会在 metadata 无 `input_image` 列时回退为视频首帧。
 - 当前 DataLoader 每个 micro step 实际只取 1 条样本；bucket sampler 控制采样顺序和尺寸路径，不代表 dense tensor batch size > 1。
 - 指标里的 `samples_per_step = grad_accum * world_size`；横屏 `480x832` 和竖屏 `832x480` token 数相同。
 - 调 `DATASET_NUM_WORKERS` 时看 GPU 利用率：周期性掉底通常是解码瓶颈。
