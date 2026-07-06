@@ -66,6 +66,7 @@ fi
 mkdir -p "$OUTPUT_ROOT"
 DMD_DATA_CSV=${DMD_DATA_CSV:-$OUTPUT_ROOT/dmd_dataset.csv}
 RUNTIME_CONFIG_PATH=${RUNTIME_CONFIG_PATH:-$OUTPUT_ROOT/runtime_dmd_config.yaml}
+METRICS_PATH=${METRICS_PATH:-$OUTPUT_ROOT/metrics.jsonl}
 
 export PYTHONPATH="$REPO_ROOT:$DMD_RUNTIME_DIR:${PYTHONPATH:-}"
 
@@ -117,6 +118,7 @@ torchrun --nproc_per_node="$NUM_GPUS" \
   --config_path "$RUNTIME_CONFIG_PATH" \
   --logdir "$OUTPUT_ROOT" \
   --data_path "$DMD_DATA_CSV" \
+  --metrics_path "$METRICS_PATH" \
   --no_visualize \
   "${WANDB_ARGS[@]}"
 popd >/dev/null

@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--wandb-save-dir", type=str, default="", help="Path to the directory to save wandb logs")
     parser.add_argument("--disable-wandb", action="store_true")
     parser.add_argument("--data_path", type=str, default=None, help="Path to the dataset")
+    parser.add_argument("--metrics_path", type=str, default=None, help="Optional JSONL path for offline training metrics.")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode, no saving or visualization")
 
     args = parser.parse_args()
@@ -32,6 +33,7 @@ def main():
     config.wandb_save_dir = args.wandb_save_dir
     config.disable_wandb = args.disable_wandb
     config.data_path = args.data_path
+    config.metrics_path = args.metrics_path
     config.debug = args.debug
 
     if config.trainer == "diffusion":

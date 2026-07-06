@@ -28,6 +28,13 @@ def build_series(rows, warmup_steps=3, tokens_per_video=None):
     losses = [float(row["loss"]) for row in rows]
     step_times = [float(row["step_time_sec"]) for row in rows]
     tokens_sec = [tokens_per_step(row) / float(row["step_time_sec"]) for row in rows]
+    has_dmd_losses = any("critic_loss" in row or "generator_loss" in row for row in rows)
+    critic_losses = [float(row.get("critic_loss", row["loss"])) for row in rows]
+    generator_points = [
+        (int(row["step"]), float(row["generator_loss"]))
+        for row in rows
+        if row.get("generator_loss") is not None
+    ]
     if tokens_per_video is None:
         videos_hour = [
             3600.0 * float(row["samples_per_step"]) / float(row["step_time_sec"])
@@ -44,6 +51,11 @@ def build_series(rows, warmup_steps=3, tokens_per_video=None):
         "losses": losses,
         "step_times": step_times,
         "loss_ema": ema(losses),
+        "has_dmd_losses": has_dmd_losses,
+        "critic_losses": critic_losses,
+        "critic_loss_ema": ema(critic_losses),
+        "generator_steps": [step for step, _ in generator_points],
+        "generator_losses": [loss for _, loss in generator_points],
         "tokens_sec": tokens_sec,
         "videos_hour": videos_hour,
         "steady_tokens_per_sec": mean(steady_tokens),
@@ -57,8 +69,21 @@ def build_series(rows, warmup_steps=3, tokens_per_video=None):
 
 def plot_loss(series, output_path):
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(series["steps"], series["losses"], color="#9ecae1", linewidth=1.0, label="raw loss")
-    ax.plot(series["steps"], series["loss_ema"], color="#08519c", linewidth=2.0, label="EMA loss")
+    if series.get("has_dmd_losses"):
+        ax.plot(series["steps"], series["critic_losses"], color="#9ecae1", linewidth=1.0, label="critic loss")
+        ax.plot(series["steps"], series["critic_loss_ema"], color="#08519c", linewidth=2.0, label="critic EMA")
+        if series["generator_steps"]:
+            ax.plot(
+                series["generator_steps"],
+                series["generator_losses"],
+                color="#d94801",
+                marker="o",
+                linewidth=1.2,
+                label="generator loss",
+            )
+    else:
+        ax.plot(series["steps"], series["losses"], color="#9ecae1", linewidth=1.0, label="raw loss")
+        ax.plot(series["steps"], series["loss_ema"], color="#08519c", linewidth=2.0, label="EMA loss")
     ax.set_xlabel("step")
     ax.set_ylabel("loss")
     ax.set_title("Training Loss")
@@ -100,6 +125,10 @@ def plot_throughput(series, output_path):
 def print_summary(series):
     print(f"total_steps: {series['total_steps']}")
     print(f"last_20pct_avg_loss: {series['last_20pct_avg_loss']:.6f}")
+    if series.get("has_dmd_losses"):
+        print(f"last_critic_loss: {series['critic_losses'][-1]:.6f}")
+        if series["generator_losses"]:
+            print(f"last_generator_loss: {series['generator_losses'][-1]:.6f}")
     print(f"steady_tokens_per_sec: {series['steady_tokens_per_sec']:.2f}")
     print(f"steady_videos_per_hour: {series['steady_videos_per_hour']:.2f}")
     print(f"observed_time_hours: {series['observed_time_hours']:.4f}")

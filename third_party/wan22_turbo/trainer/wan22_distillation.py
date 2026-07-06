@@ -20,6 +20,8 @@ import wandb
 import time
 import os
 from safetensors.torch import save_file
+from metrics_utils import MetricsWriter
+from dmd.training_metrics import build_dmd_metrics_record
 from dmd.wan22_lora import (
     export_lora_state_dict,
     filter_lora_state_dict,
@@ -68,6 +70,8 @@ class Trainer:
 
         self.output_path = config.logdir
         self.use_lora = lora_enabled(config)
+        metrics_path = getattr(config, "metrics_path", None)
+        self.metrics_writer = MetricsWriter(metrics_path) if metrics_path and self.is_main_process else None
 
         # Step 2: Initialize the model and optimizer
         if config.distribution_loss == "causvid":
@@ -243,6 +247,10 @@ class Trainer:
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
+
+    @staticmethod
+    def _optimizer_lr(optimizer):
+        return float(optimizer.param_groups[0]["lr"])
 
     def load(self, out_path):
         # 1. 找到最新的checkpoint文件夹（按步数排序）
@@ -450,6 +458,7 @@ class Trainer:
         start_step = self.step
 
         while True:
+            step_start_time = time.time()
             if self.is_main_process:
                 print(f"training step {self.step} ...")
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
@@ -493,11 +502,14 @@ class Trainer:
 
             # Logging
             if self.is_main_process:
+                generator_loss_value = None
+                critic_loss_value = critic_log_dict["critic_loss"].mean().item()
                 wandb_loss_dict = {}
                 if TRAIN_GENERATOR:
+                    generator_loss_value = generator_log_dict["generator_loss"].mean().item()
                     wandb_loss_dict.update(
                         {
-                            "generator_loss": generator_log_dict["generator_loss"].mean().item(),
+                            "generator_loss": generator_loss_value,
                             "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
                             "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                         }
@@ -505,7 +517,7 @@ class Trainer:
 
                 wandb_loss_dict.update(
                     {
-                        "critic_loss": critic_log_dict["critic_loss"].mean().item(),
+                        "critic_loss": critic_loss_value,
                         "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
                     }
                 )
@@ -521,12 +533,31 @@ class Trainer:
 
             if self.is_main_process:
                 current_time = time.time()
+                step_time_sec = current_time - step_start_time
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
+                if self.metrics_writer is not None:
+                    self.metrics_writer.write(
+                        build_dmd_metrics_record(
+                            step=self.step,
+                            critic_loss=critic_loss_value,
+                            generator_loss=generator_loss_value,
+                            step_time_sec=step_time_sec,
+                            num_frames=self.config.num_frames,
+                            height=self.config.h,
+                            width=self.config.w,
+                            batch_size=self.config.batch_size,
+                            world_size=self.world_size,
+                            train_generator=TRAIN_GENERATOR,
+                            lr_generator=self._optimizer_lr(self.generator_optimizer),
+                            lr_critic=self._optimizer_lr(self.critic_optimizer),
+                            dfake_gen_update_ratio=self.config.dfake_gen_update_ratio,
+                        )
+                    )
 
             max_iters = getattr(self.config, "max_iters", None)
             if max_iters is not None and (self.step - start_step) >= max_iters:
