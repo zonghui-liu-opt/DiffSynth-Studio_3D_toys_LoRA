@@ -8,9 +8,10 @@
 - `FIG360_LORA_PATH`：Task-01 产出的 figurine360 LoRA safetensors。
 - `MERGED_MODEL_ROOT`：离线 merge 后的 teacher 目录。
 - `DATA_ROOT`：真实视频数据根目录。
-- `METADATA_PATH`：建议使用 `check_dataset.py` 生成的 `metadata_fixed.csv`。
+- `METADATA_PATH`：建议使用 `check_dataset.py` 生成的 `metadata_fixed.csv`，其中包含 `height,width,bucket` 供 DMD 横竖屏分桶使用。
 - `OUTPUT_ROOT`：DMD 训练输出目录。
-- `HEIGHT/WIDTH/NUM_FRAMES`：训练分辨率和帧数；脚本会自动生成 Turbo latent shape。
+- `HEIGHT/WIDTH/NUM_FRAMES`：默认横屏训练分辨率和帧数；开启分桶时横屏使用 `HEIGHT x WIDTH`，竖屏使用 `WIDTH x HEIGHT`。
+- `ENABLE_ORIENTATION_BUCKETS`：DMD orientation bucket 开关；默认 `1`，读取 metadata 中的 `height,width,bucket`，同一任务内保留横屏 `480x832` 与竖屏 `832x480`。
 - `NUM_GPUS/MAX_ITERS/LOG_ITERS`：卡数、训练步数和保存间隔。
 - `VALIDATION_INTERVAL`：Stage B 验证节奏；默认 200，与 `LOG_ITERS` 保持一致，训练保存 checkpoint 后用独立验证脚本跑 holdout。
 - `DATALOADER_NUM_WORKERS`：DMD dataloader workers；默认 8。
@@ -26,6 +27,8 @@ python3 check_dataset.py \
   --metadata_path "$DATA_ROOT/metadata.csv" \
   --height 480 --width 832 --num_frames 121 | tee "$DATA_ROOT/check_dataset.log"
 ```
+
+`check_dataset.py` 会输出带 `height,width,bucket` 的 `metadata_fixed.csv`。DMD 启动脚本会把这些列保留到 Turbo CSV，并在训练时用 bucket sampler 让同一 distributed step 内各 rank 取同一方向样本；没有这些列时会退回固定 `HEIGHT/WIDTH` resize。
 
 2. merge：
 
@@ -107,7 +110,7 @@ DATA_ROOT=/path/to/figurine_dataset \
 METADATA_PATH=/path/to/figurine_dataset/metadata_smoke16.csv \
 OUTPUT_ROOT=./models/train/figurine360_dmd_lora_smoke \
 NUM_GPUS=2 HEIGHT=480 WIDTH=832 NUM_FRAMES=121 \
-MAX_ITERS=50 LOG_ITERS=25 VALIDATION_INTERVAL=25 \
+ENABLE_ORIENTATION_BUCKETS=1 MAX_ITERS=50 LOG_ITERS=25 VALIDATION_INTERVAL=25 \
 bash train_figurine360_dmd_lora.sh
 ```
 
@@ -121,7 +124,7 @@ DATA_ROOT=/path/to/figurine_dataset \
 METADATA_PATH=/path/to/figurine_dataset/metadata_fixed.csv \
 OUTPUT_ROOT=./models/train/figurine360_dmd_lora \
 NUM_GPUS=4 HEIGHT=480 WIDTH=832 NUM_FRAMES=121 \
-MAX_ITERS=3000 LOG_ITERS=200 VALIDATION_INTERVAL=200 \
+ENABLE_ORIENTATION_BUCKETS=1 MAX_ITERS=3000 LOG_ITERS=200 VALIDATION_INTERVAL=200 \
 bash train_figurine360_dmd_lora.sh
 ```
 

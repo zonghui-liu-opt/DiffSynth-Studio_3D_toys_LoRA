@@ -23,6 +23,14 @@ def _resolve_data_path(dataset_root: Path, value: str) -> Path:
     return path.resolve()
 
 
+def _has_value(value) -> bool:
+    return value is not None and str(value) != ""
+
+
+def _bucket_from_height_width(height: str, width: str) -> str:
+    return "landscape" if int(float(width)) >= int(float(height)) else "portrait"
+
+
 def convert_metadata_to_turbo_csv(
     *,
     dataset_root: str | Path,
@@ -43,16 +51,29 @@ def convert_metadata_to_turbo_csv(
             if not video:
                 raise ValueError("Metadata must contain `video` or `path`.")
             num_frames = row.get("num_frames") or str(default_num_frames)
-            rows_out.append(
-                {
-                    "path": str(_resolve_data_path(dataset_root, video)),
-                    "text": text,
-                    "num_frames": str(int(float(num_frames))),
-                }
-            )
+            output_row = {
+                "path": str(_resolve_data_path(dataset_root, video)),
+                "text": text,
+                "num_frames": str(int(float(num_frames))),
+            }
+            height = row.get("height")
+            width = row.get("width")
+            bucket = row.get("bucket")
+            if _has_value(height) and _has_value(width):
+                output_row["height"] = str(int(float(height)))
+                output_row["width"] = str(int(float(width)))
+                output_row["bucket"] = bucket if _has_value(bucket) else _bucket_from_height_width(height, width)
+            elif _has_value(bucket):
+                output_row["height"] = ""
+                output_row["width"] = ""
+                output_row["bucket"] = str(bucket)
+            rows_out.append(output_row)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["path", "text", "num_frames"]
+    if any(any(key in row for key in ("height", "width", "bucket")) for row in rows_out):
+        fieldnames += ["height", "width", "bucket"]
     with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["path", "text", "num_frames"])
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows_out)
     return {"rows": len(rows_out), "output_path": str(output_path)}

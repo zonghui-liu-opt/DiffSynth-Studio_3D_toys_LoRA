@@ -44,6 +44,23 @@ Stage A 完成；用户确认 gate-0 merged teacher 对齐已在内网通过，�
 | gate-0 merged teacher 对齐 | 用户已在内网完成并确认无差别，本次跳过实现与复跑 |
 | H100 正式训练/视频生成 | 本地只做脚本、manifest、单元测试和语法验证；真实权重长跑在内网执行 |
 
+## Task-03：figurine360-DMD 横竖屏分桶
+
+### 目标
+参考 SFT LoRA 的 orientation bucket 方案，在 DMD LoRA 训练路径中支持同一训练任务内按 `landscape/portrait` metadata 分桶，保留横屏 `480x832` 与竖屏 `832x480`，避免统一拉伸到单一 `HEIGHT/WIDTH`。
+
+### 当前阶段
+本地实现与验证完成；H100 真训练待内网使用真实数据/权重运行。
+
+### 阶段
+
+- [x] 写入 DMD bucket 红灯测试，覆盖 metadata 转换、dataset resize、trainer 动态 shape、launcher 开关
+- [x] 扩展 DMD CSV schema，保留 `height,width,bucket`
+- [x] 扩展 vendored Turbo DMD dataset 和 distributed bucket sampler
+- [x] 扩展 trainer 使用 bucket sampler，并按 batch `height,width` 计算 latent shape
+- [x] 扩展 H100 launcher/config/NOTE_DMD
+- [x] 跑本地测试与语法检查
+
 ### 关键决策
 
 | 决策 | 理由 |
@@ -53,6 +70,7 @@ Stage A 完成；用户确认 gate-0 merged teacher 对齐已在内网通过，�
 | `real_guidance_scale=4.0` | Turbo DMD 代码是附加引导 `cond + (cond-uncond)*scale`，等价标准 teacher CFG g=5 |
 | `dfake_gen_update_ratio=5` 沿用上游语义 | 上游长期比例为 5 fake score : 1 generator，避免改已验证训练循环 |
 | DMD LoRA 导出时 strip `model.` 前缀 | DiffSynth/ComfyUI 需要匹配 DiT 内部 key，如 `blocks.*.q.lora_A.default.weight` |
+| DMD orientation bucket 默认开启 | 与 SFT LoRA 分桶一致，保留横屏 `480x832` 和竖屏 `832x480`，避免把竖屏统一拉伸到横屏 |
 
 ## 目标
 在当前 DiffSynth-Studio 仓库中完成 Stage A 可离线验证的 Wan2.2-TI2V-5B LoRA 训练辅助工具、指标记录、绘图、数据集 smoke test 与 Stage B 上机 checklist。

@@ -27,6 +27,13 @@
 - DiffSynth 本地 TI2V alignment 不能使用示例里的 `ModelConfig(model_id=...)`，内网无外网应使用 `ModelConfig(path=...)` 指向 merged teacher 目录。
 - DiffSynth student 推理可直接加载 merged teacher 目录后 `pipe.load_lora(pipe.dit, figurine360_dmd_lora_rank64.safetensors)`，脚本入口为 `tools/diffsynth_wan22_dmd_lora_infer.py`。
 
+### DMD 横竖屏分桶实现发现
+- SFT LoRA 已由 `check_dataset.py` 输出 `height,width,bucket`，DMD 不需要重新探测视频方向；只需在 `prepare_dmd_dataset_csv.py` 保留这些列即可复用同一份 `metadata_fixed.csv`。
+- Turbo `ODERegressionCSVDataset` 原先固定 resize 到全局 `h,w`；分桶后 dataset 按样本 `height,width` resize，缺失 metadata 时仍退回全局 `h,w`，保持旧 CSV 兼容。
+- DMD 训练的 generator/critic forward 使用 `config.image_or_video_shape` 构造噪声 latent；orientation bucket 必须在每个 batch 里用真实 `height,width` 改写最后两个 latent 维度，否则竖屏视频 tensor 与横屏 latent shape 不一致。
+- `BucketOffsetDistributedSampler` 按 bucket 分组，并按 `world_size * batch_size` 对齐每个 bucket，避免 distributed step 或本地 batch 混入横竖屏样本。
+- 当前 DMD 配置和 launcher 默认开启 `enable_orientation_buckets`/`ENABLE_ORIENTATION_BUCKETS=1`；若 metadata 没有 `height,width,bucket`，行为会自然退回固定横屏分辨率。
+
 ## 需求
 - Stage A 在 MacBook CPU-only 环境完成离线可验证开发，不加载真实权重、不跑真实训练。
 - Stage B 在无外网 H100 环境只改脚本顶部变量块即可跑正式 LoRA SFT。

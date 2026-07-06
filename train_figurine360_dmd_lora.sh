@@ -14,6 +14,7 @@ DMD_RUNTIME_DIR=${DMD_RUNTIME_DIR:-$REPO_ROOT/third_party/wan22_turbo}
 CONFIG_PATH=${CONFIG_PATH:-$REPO_ROOT/configs/dmd/figurine360_wan22_dmd_lora.yaml}
 HEIGHT=${HEIGHT:-480}
 WIDTH=${WIDTH:-832}
+ENABLE_ORIENTATION_BUCKETS=${ENABLE_ORIENTATION_BUCKETS:-1}
 NUM_FRAMES=${NUM_FRAMES:-121}
 NUM_GPUS=${NUM_GPUS:-4}
 NODE_COUNT=${NODE_COUNT:-1}
@@ -85,6 +86,7 @@ python3 -m dmd.wan22_config \
   --validation_interval "$VALIDATION_INTERVAL" \
   --batch_size "$BATCH_SIZE" \
   --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
+  --enable_orientation_buckets "$ENABLE_ORIENTATION_BUCKETS" \
   --lr "$LR" \
   --lr_critic "$LR_CRITIC" \
   --ema_weight "$EMA_WEIGHT"

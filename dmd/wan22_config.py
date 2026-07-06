@@ -51,6 +51,7 @@ def load_dmd_config_summary(path: str | Path) -> dict:
         "max_iters": int(cfg.get("max_iters", 0)),
         "validation_interval": int(cfg.get("validation_interval", cfg.get("log_iters", 0))),
         "dataloader_num_workers": int(cfg.get("dataloader_num_workers", 8)),
+        "enable_orientation_buckets": bool(cfg.get("enable_orientation_buckets", False)),
     }
 
 
@@ -69,6 +70,7 @@ def write_runtime_config(
     ema_weight: float | None = None,
     validation_interval: int | None = None,
     dataloader_num_workers: int | None = None,
+    enable_orientation_buckets: bool | int | None = None,
 ) -> dict:
     cfg = _load_yaml(template_path)
     cfg["h"] = int(height)
@@ -84,6 +86,8 @@ def write_runtime_config(
     cfg["batch_size"] = int(batch_size)
     if dataloader_num_workers is not None:
         cfg["dataloader_num_workers"] = int(dataloader_num_workers)
+    if enable_orientation_buckets is not None:
+        cfg["enable_orientation_buckets"] = bool(enable_orientation_buckets)
     if lr is not None:
         cfg["lr"] = float(lr)
     if lr_critic is not None:
@@ -111,6 +115,7 @@ def parse_args():
     parser.add_argument("--ema_weight", type=float, default=None)
     parser.add_argument("--validation_interval", type=int, default=None)
     parser.add_argument("--dataloader_num_workers", type=int, default=None)
+    parser.add_argument("--enable_orientation_buckets", type=int, choices=(0, 1), default=None)
     return parser.parse_args()
 
 

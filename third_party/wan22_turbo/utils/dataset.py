@@ -15,6 +15,38 @@ import decord
 from torchvision.transforms.functional import resize
 from torch.utils.data.distributed import DistributedSampler
 
+
+def _metadata_has_value(value):
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(value) != ""
+
+
+def _metadata_int(row, key):
+    value = row.get(key)
+    if not _metadata_has_value(value):
+        return None
+    return int(float(value))
+
+
+def _metadata_bucket(row, fallback_h=None, fallback_w=None):
+    bucket = row.get("bucket")
+    if _metadata_has_value(bucket):
+        return str(bucket)
+    height = _metadata_int(row, "height")
+    width = _metadata_int(row, "width")
+    if height is not None and width is not None:
+        return "landscape" if width >= height else "portrait"
+    if fallback_h is not None and fallback_w is not None:
+        return "landscape" if fallback_w >= fallback_h else "portrait"
+    return "landscape"
+
+
 class OffsetDistributedSampler(DistributedSampler):
     def __init__(self, dataset, initial_step=0, gpu_num=4, **kwargs):
         super().__init__(dataset, **kwargs)
@@ -36,6 +68,86 @@ class OffsetDistributedSampler(DistributedSampler):
             self.first_time = False  # 标志位设为 False，后续不再跳过
 
         return iter(indices)
+
+
+class BucketOffsetDistributedSampler(torch.utils.data.Sampler):
+    def __init__(
+        self,
+        dataset,
+        initial_step=0,
+        gpu_num=1,
+        rank=0,
+        batch_size=1,
+        shuffle=False,
+        drop_last=True,
+        seed=0,
+    ):
+        self.dataset = dataset
+        self.initial_step = max(int(initial_step), 0)
+        self.gpu_num = max(int(gpu_num), 1)
+        self.rank = int(rank)
+        self.batch_size = max(int(batch_size), 1)
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+        self.first_time = True
+        self.bucket_to_indices = self._build_bucket_indices()
+
+    def _build_bucket_indices(self):
+        if not hasattr(self.dataset, "data"):
+            raise ValueError("BucketOffsetDistributedSampler requires dataset.data metadata.")
+        buckets = {}
+        for index in range(len(self.dataset)):
+            row = self.dataset.data[index % len(self.dataset.data)]
+            bucket = _metadata_bucket(row)
+            buckets.setdefault(bucket, []).append(index)
+        if not buckets:
+            raise ValueError("No DMD bucket metadata found.")
+        return buckets
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _align_bucket_for_ranks(self, indices):
+        if not indices:
+            return indices
+        bucket_unit = self.gpu_num * self.batch_size
+        remainder = len(indices) % bucket_unit
+        if remainder == 0:
+            return indices
+        if self.drop_last and len(indices) >= bucket_unit:
+            return indices[: len(indices) - remainder]
+        pad = bucket_unit - remainder
+        repeats = (pad // len(indices)) + 1
+        return indices + (indices * repeats)[:pad]
+
+    def __iter__(self):
+        import random
+
+        rng = random.Random(self.seed + self.epoch)
+        bucket_names = list(self.bucket_to_indices)
+        if self.shuffle:
+            rng.shuffle(bucket_names)
+
+        rank_indices = []
+        for bucket_name in bucket_names:
+            indices = list(self.bucket_to_indices[bucket_name])
+            if self.shuffle:
+                rng.shuffle(indices)
+            indices = self._align_bucket_for_ranks(indices)
+            rank_indices.extend(indices[self.rank :: self.gpu_num])
+
+        if self.first_time and self.initial_step > 0:
+            rank_indices = rank_indices[self.initial_step :]
+            self.first_time = False
+        return iter(rank_indices)
+
+    def __len__(self):
+        total = 0
+        for indices in self.bucket_to_indices.values():
+            total += len(self._align_bucket_for_ranks(list(indices))) // self.gpu_num
+        return total
 
 
 class TextDataset(Dataset):
@@ -269,24 +381,46 @@ class TextImagePairDataset(Dataset):
 
 
 class ODERegressionCSVDataset(Dataset):
-    def __init__(self, data_path: str, max_pair: int = int(1e8), num_frames=81, h=480, w=832):
+    def __init__(
+        self,
+        data_path: str,
+        max_pair: int = int(1e8),
+        num_frames=81,
+        h=480,
+        w=832,
+        enable_orientation_buckets=False,
+    ):
         self.max_pair = max_pair
-        self.data = pd.read_csv(data_path)
-        self.data["text"] = self.data["text"].fillna("")
+        dataframe = pd.read_csv(data_path)
+        dataframe["text"] = dataframe["text"].fillna("")
+        self.data = dataframe.to_dict("records")
         self.log_file = "log/datasets_error_log.txt"
         self.num_frames = num_frames
         self.h = h
         self.w = w
+        self.enable_orientation_buckets = enable_orientation_buckets
 
     def __len__(self):
         return len(self.data)
 
+    def _target_height_width(self, sample):
+        if self.enable_orientation_buckets:
+            height = _metadata_int(sample, "height")
+            width = _metadata_int(sample, "width")
+            if height is not None and width is not None:
+                return height, width
+            bucket = _metadata_bucket(sample, fallback_h=self.h, fallback_w=self.w)
+            if bucket == "portrait":
+                return self.w, self.h
+        return self.h, self.w
+
     def _preprocess_video(self, sample) -> torch.Tensor:
         path = sample["path"]
-        num_frames = sample["num_frames"]
+        num_frames = int(float(sample["num_frames"]))
         if num_frames < self.num_frames:
             raise ValueError(f"Error: num_frames < {self.num_frames}")
         frame_indices = list(range(self.num_frames))
+        target_h, target_w = self._target_height_width(sample)
 
         if path.endswith(".mp4") or path.endswith(".mkv"):
             path = Path(path)
@@ -309,28 +443,36 @@ class ODERegressionCSVDataset(Dataset):
             frames = torch.from_numpy(frames).float()
             frames = frames.permute(0, 3, 1, 2).contiguous()  # [T, C, H, W]
 
-        video_tensor = torch.stack([resize(frame, (self.h, self.w)) for frame in frames], dim=0)
+        video_tensor = torch.stack([resize(frame, (target_h, target_w)) for frame in frames], dim=0)
         video_tensor = video_tensor.permute(1, 0, 2, 3) / 255.0
         video_tensor = video_tensor * 2 - 1
-        return video_tensor
+        return video_tensor, target_h, target_w
 
     def __getitem__(self, index):
-        sample = self.data.iloc[index]
+        sample = self.data[index]
         try:
-            video = self._preprocess_video(sample)
+            video, target_h, target_w = self._preprocess_video(sample)
             return {
                 "prompts": sample["text"],
                 "video": video,
+                "height": target_h,
+                "width": target_w,
+                "bucket": _metadata_bucket(sample, fallback_h=target_h, fallback_w=target_w),
             }
         except Exception as e:
             # 记录错误日志
+            os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
             with open(self.log_file, "a") as f:
                 f.write(f"Error at index {index}: {str(e)}\n")
             print(f"Error at index {index}: {e}. Skipping this index.")
             # 跳过当前样本，返回 None 或抛出异常
+            target_h, target_w = self._target_height_width(sample)
             return {
                 "prompts": "",
-                "video": torch.zeros((3, self.num_frames, self.h, self.w)),  # 占位符视频张量
+                "video": torch.zeros((3, self.num_frames, target_h, target_w)),  # 占位符视频张量
+                "height": target_h,
+                "width": target_w,
+                "bucket": _metadata_bucket(sample, fallback_h=target_h, fallback_w=target_w),
             }
 
 def cycle(dl):

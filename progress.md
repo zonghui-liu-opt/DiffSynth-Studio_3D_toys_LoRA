@@ -2,6 +2,34 @@
 
 ## 会话：2026-07-06
 
+### Task-03：figurine360-DMD 横竖屏分桶
+- **状态：** local implementation complete；H100 真训练待内网运行
+- 执行的操作：
+  - 新增 DMD orientation bucket 单测，覆盖 CSV metadata 保留、dataset 横竖屏 resize、distributed sampler 分桶、本地 batch 不跨 bucket、trainer/launcher 开关。
+  - `tools/prepare_dmd_dataset_csv.py` 保留 `height,width,bucket`，旧 metadata 无这些列时继续输出原 `path,text,num_frames` schema。
+  - `third_party/wan22_turbo/utils/dataset.py` 支持按样本 `height,width` resize，并新增 `BucketOffsetDistributedSampler`，按 `world_size * batch_size` 对齐每个 bucket。
+  - `third_party/wan22_turbo/trainer/wan22_distillation.py` 在 `enable_orientation_buckets` 时启用 bucket sampler，并用 batch 的 `height,width` 动态计算 latent shape。
+  - `dmd/wan22_config.py`、`configs/dmd/figurine360_wan22_dmd_lora.yaml`、`train_figurine360_dmd_lora.sh` 打通 `ENABLE_ORIENTATION_BUCKETS`。
+  - 更新 `NOTE_DMD.md`，说明 `metadata_fixed.csv` 的 `height,width,bucket` 要求和内网训练命令。
+- 创建/修改的文件：
+  - `tests/test_dmd_orientation_buckets.py`
+  - `tools/prepare_dmd_dataset_csv.py`
+  - `third_party/wan22_turbo/utils/dataset.py`
+  - `third_party/wan22_turbo/trainer/wan22_distillation.py`
+  - `dmd/wan22_config.py`
+  - `configs/dmd/figurine360_wan22_dmd_lora.yaml`
+  - `train_figurine360_dmd_lora.sh`
+  - `NOTE_DMD.md`
+  - `task_plan.md`
+  - `progress.md`
+  - `findings.md`
+- 测试：
+  - `pytest tests/test_dmd_orientation_buckets.py -q`：5 passed
+  - `pytest tests/test_dmd_orientation_buckets.py tests/test_dmd_stage_a_contract.py tests/test_dmd_stage_b_validation.py -q`：22 passed
+  - `python3 -m py_compile tools/prepare_dmd_dataset_csv.py dmd/wan22_config.py third_party/wan22_turbo/utils/dataset.py third_party/wan22_turbo/trainer/wan22_distillation.py`：通过
+  - `bash -n train_figurine360_dmd_lora.sh`：通过
+  - `pytest tests/ -q`：48 passed, 2 warnings
+
 ### Task-03：figurine360-DMD Stage B 剩余验证
 - **状态：** local implementation complete；H100 真权重视频生成/指标执行待内网运行
 - 用户确认：

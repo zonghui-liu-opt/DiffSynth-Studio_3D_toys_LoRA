@@ -1,7 +1,12 @@
 import gc
 import logging
 
-from utils.dataset import ODERegressionCSVDataset, cycle, OffsetDistributedSampler
+from utils.dataset import (
+    BucketOffsetDistributedSampler,
+    ODERegressionCSVDataset,
+    OffsetDistributedSampler,
+    cycle,
+)
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -152,15 +157,27 @@ class Trainer:
             num_frames=config.num_frames,
             h=config.h,
             w=config.w,
+            enable_orientation_buckets=config.get("enable_orientation_buckets", False),
         )
-            
-        sampler = OffsetDistributedSampler(
-            dataset,
-            initial_step=self.step,
-            gpu_num=self.world_size,
-            shuffle=False,
-            drop_last=True,
-        )
+
+        if config.get("enable_orientation_buckets", False):
+            sampler = BucketOffsetDistributedSampler(
+                dataset,
+                initial_step=self.step,
+                gpu_num=self.world_size,
+                rank=global_rank,
+                batch_size=config.batch_size,
+                shuffle=False,
+                drop_last=True,
+            )
+        else:
+            sampler = OffsetDistributedSampler(
+                dataset,
+                initial_step=self.step,
+                gpu_num=self.world_size,
+                shuffle=False,
+                drop_last=True,
+            )
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=config.batch_size,
@@ -248,6 +265,14 @@ class Trainer:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"{model_path} not found")
         return model_path, step
+
+    def _batch_int(self, batch, key, default):
+        value = batch.get(key, default)
+        if torch.is_tensor(value):
+            return int(value.reshape(-1)[0].item())
+        if isinstance(value, (list, tuple)):
+            return int(value[0])
+        return int(value)
     
     def save(self):
         print("Start gathering distributed model states...")
@@ -315,8 +340,12 @@ class Trainer:
         image_latent = None
 
         batch_size = len(text_prompts)
+        sample_h = self._batch_int(batch, "height", self.config.h)
+        sample_w = self._batch_int(batch, "width", self.config.w)
         image_or_video_shape = list(self.config.image_or_video_shape)
         image_or_video_shape[0] = batch_size
+        image_or_video_shape[-2] = sample_h // 16
+        image_or_video_shape[-1] = sample_w // 16
 
         # Step 2: Extract the conditional infos
         with torch.no_grad():
