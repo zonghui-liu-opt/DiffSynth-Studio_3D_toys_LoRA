@@ -2,6 +2,40 @@
 
 ## 会话：2026-07-06
 
+### Task-03：figurine360-DMD Stage B 剩余验证
+- **状态：** local implementation complete；H100 真权重视频生成/指标执行待内网运行
+- 用户确认：
+  - gate-0 merged teacher 与 runtime load figurine360 LoRA 的同 seed/prompt/首帧对比已在内网实现并验证无差别。
+  - 本次跳过 gate-0，其余 Stage B 验证正常推进。
+- 当前执行计划：
+  - 已写 Stage B 本地红灯测试并确认缺接口失败。
+  - 已补 LoRA 推理加载、EMA resume、validation runner、视频指标、DiffSynth 本地推理脚本和 NOTE_DMD 命令。
+  - 已运行 pytest/py_compile/bash 语法检查并记录结果。
+- 创建/修改的文件：
+  - `dmd/wan22_lora.py`
+  - `dmd/wan22_config.py`
+  - `dmd/stage_b_validation.py`
+  - `dmd/video_metrics.py`
+  - `tools/validate_dmd_stage_b.py`
+  - `tools/compute_dmd_video_metrics.py`
+  - `tools/diffsynth_wan22_ti2v_infer.py`
+  - `tools/diffsynth_wan22_dmd_lora_infer.py`
+  - `third_party/wan22_turbo/wan2.2_fewstep.py`
+  - `third_party/wan22_turbo/trainer/wan22_distillation.py`
+  - `configs/dmd/figurine360_wan22_dmd_lora.yaml`
+  - `configs/dmd/figurine360_wan22_teacher50.yaml`
+  - `train_figurine360_dmd_lora.sh`
+  - `tests/test_dmd_stage_b_validation.py`
+  - `NOTE_DMD.md`
+  - `task_plan.md`
+  - `progress.md`
+- 测试：
+  - `pytest tests/test_dmd_stage_b_validation.py tests/test_dmd_lora_utils.py tests/test_dmd_stage_a_contract.py -q`：19 passed（新增 DiffSynth DMD LoRA 脚本前）
+  - `python3 -m py_compile dmd/wan22_lora.py dmd/wan22_config.py dmd/stage_b_validation.py dmd/video_metrics.py tools/validate_dmd_stage_b.py tools/compute_dmd_video_metrics.py tools/diffsynth_wan22_ti2v_infer.py tools/diffsynth_wan22_dmd_lora_infer.py third_party/wan22_turbo/wan2.2_fewstep.py third_party/wan22_turbo/trainer/wan22_distillation.py`：通过
+  - `bash -n train_figurine360_dmd_lora.sh`：通过
+  - `pytest tests/ -q`：43 passed, 2 warnings
+  - `git diff --check`：未执行成功；当前目录不是 git 仓库
+
 ### Task-03：figurine360-DMD Stage A
 - **状态：** complete（按用户要求，Stage A 后停止等待检查）
 - 执行的操作：

@@ -6,7 +6,7 @@
 在当前仓库内完成 Wan2.2-TI2V-5B Turbo DMD 的 Stage A 可离线验证实现：vendored runtime、LoRA-only DMD 支撑、H100 launcher、配置、metadata 转换、NOTE_DMD 与 Phase 2/3 路线。完成后停止等待检查。
 
 ### 当前阶段
-Stage A 完成，按用户要求停止等待检查。
+Stage A 完成；用户确认 gate-0 merged teacher 对齐已在内网通过，当前进入 Stage B 剩余验证工具实现。
 
 ### 阶段
 
@@ -19,6 +19,30 @@ Stage A 完成，按用户要求停止等待检查。
 - [x] 新增 DMD YAML、metadata 转换工具、H100 launcher
 - [x] 新增 `docs/task03_baseline.md`、`NOTE_DMD.md`、`docs/task03_phase23_roadmap.md`
 - [x] 跑完最终测试并记录结果
+
+## Task-03：figurine360-DMD Stage B 剩余验证
+
+### 目标
+在当前仓库内补齐 Stage B 除 gate-0 外的验收闭环：DMD LoRA 推理加载、EMA 断点恢复、H100 验证 manifest/runner、视频指标脚本、训练/验证命令文档与本地可测覆盖。
+
+### 当前阶段
+本地实现与验证完成；H100 真权重视频生成/指标执行待内网运行。
+
+### 阶段
+
+- [x] 写入 Stage B 红灯测试，覆盖 LoRA safetensors 导入、EMA resume key、验证 manifest/命令生成、基础视频指标
+- [x] 修复/扩展 DMD LoRA runtime 加载与 `wan2.2_fewstep.py` 推理入口
+- [x] 新增 Stage B holdout validation runner 与视频指标工具
+- [x] 修复 EMA LoRA checkpoint resume，暴露 Stage B 验证相关配置变量
+- [x] 更新 `NOTE_DMD.md` 的 5.2 alignment、训练后验证、推理和指标命令
+- [x] 跑本地测试、语法检查并记录结果
+
+### 范围说明
+
+| 项 | 决策 |
+|----|------|
+| gate-0 merged teacher 对齐 | 用户已在内网完成并确认无差别，本次跳过实现与复跑 |
+| H100 正式训练/视频生成 | 本地只做脚本、manifest、单元测试和语法验证；真实权重长跑在内网执行 |
 
 ### 关键决策
 

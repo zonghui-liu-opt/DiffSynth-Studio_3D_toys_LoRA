@@ -165,7 +165,7 @@ class Trainer:
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=config.get("dataloader_num_workers", 8))
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -195,7 +195,10 @@ class Trainer:
             # Load EMA state dict if available in checkpoint
             if pretrained_ckpt_path is not None:
                 checkpoint_state_dict = torch.load(pretrained_ckpt_path, map_location="cpu")
-                if "generator_ema" in checkpoint_state_dict:
+                if self.use_lora and "generator_ema_lora" in checkpoint_state_dict:
+                    print("Loading generator_ema_lora from checkpoint")
+                    self.generator_ema.load_state_dict(checkpoint_state_dict["generator_ema_lora"])
+                elif "generator_ema" in checkpoint_state_dict:
                     print("Loading generator_ema from checkpoint")
                     self.generator_ema.load_state_dict(checkpoint_state_dict["generator_ema"])
                 else:

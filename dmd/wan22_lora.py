@@ -7,6 +7,7 @@ does not import the Wan model stack or initialize CUDA.
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 from typing import Iterable
 
 import torch
@@ -163,6 +164,63 @@ def export_lora_state_dict(
             exported[f"{target}.alpha"] = alpha.reshape(()).detach().cpu()
 
     return dict(sorted(exported.items()))
+
+
+def import_lora_state_dict_for_runtime(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    strip_prefixes: Iterable[str] = ("model.", "pipe.dit."),
+    add_prefix: str = "",
+) -> dict[str, torch.Tensor]:
+    """Convert exported LoRA keys back to the local LoRALinear state format.
+
+    Training checkpoints store runtime keys such as
+    ``model.blocks.0.q.lora_A.weight``.  The exported safetensors file strips
+    ``model.`` and uses DiffSynth/ComfyUI-style ``.default.weight`` keys.  This
+    helper accepts either form and returns keys loadable into the module that
+    actually owns the patched Linear layers, normally ``pipe.generator.model``.
+    """
+
+    imported = {}
+    for name, tensor in state_dict.items():
+        name = normalize_state_key(name)
+        name = _strip_prefix(name, strip_prefixes)
+        if name.endswith(".lora_A.default.weight"):
+            name = name.replace(".lora_A.default.weight", ".lora_A.weight")
+        elif name.endswith(".lora_B.default.weight"):
+            name = name.replace(".lora_B.default.weight", ".lora_B.weight")
+        elif name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight") or name.endswith(".alpha"):
+            pass
+        else:
+            continue
+        if add_prefix and not name.startswith(add_prefix):
+            name = f"{add_prefix}{name}"
+        imported[name] = tensor.detach().cpu().contiguous()
+    return dict(sorted(imported.items()))
+
+
+def load_generator_lora_checkpoint(path: str | Path, *, source: str = "auto") -> dict[str, torch.Tensor]:
+    """Load a DMD generator LoRA state from safetensors or a trainer model.pt."""
+
+    path = Path(path)
+    if path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        return load_file(str(path))
+
+    checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Unsupported LoRA checkpoint payload: {path}")
+
+    if source not in {"auto", "ema", "generator"}:
+        raise ValueError("lora source must be one of: auto, ema, generator")
+    if source in {"auto", "ema"} and "generator_ema_lora" in checkpoint:
+        return checkpoint["generator_ema_lora"]
+    if source in {"auto", "generator"} and "generator_lora" in checkpoint:
+        return checkpoint["generator_lora"]
+    if all(is_lora_state_key(key) for key in checkpoint):
+        return checkpoint
+    raise RuntimeError(f"No generator LoRA state found in checkpoint: {path}")
 
 
 def load_lora_state_dict(module: nn.Module, state_dict: dict[str, torch.Tensor], *, strict_lora: bool = True):

@@ -22,7 +22,9 @@ MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29501}
 MAX_ITERS=${MAX_ITERS:-3000}
 LOG_ITERS=${LOG_ITERS:-200}
+VALIDATION_INTERVAL=${VALIDATION_INTERVAL:-200}
 BATCH_SIZE=${BATCH_SIZE:-1}
+DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-8}
 LR=${LR:-5e-5}
 LR_CRITIC=${LR_CRITIC:-5e-5}
 EMA_WEIGHT=${EMA_WEIGHT:-0.995}
@@ -80,7 +82,9 @@ python3 -m dmd.wan22_config \
   --num_frames "$NUM_FRAMES" \
   --max_iters "$MAX_ITERS" \
   --log_iters "$LOG_ITERS" \
+  --validation_interval "$VALIDATION_INTERVAL" \
   --batch_size "$BATCH_SIZE" \
+  --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
   --lr "$LR" \
   --lr_critic "$LR_CRITIC" \
   --ema_weight "$EMA_WEIGHT"

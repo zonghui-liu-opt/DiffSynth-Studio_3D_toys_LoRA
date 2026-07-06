@@ -18,6 +18,15 @@
 | checkpoint 保存 LoRA-only + optimizer state，并导出 generator EMA safetensors | 避免 20GB full model checkpoint，产物直接给 DiffSynth/ComfyUI 加载 |
 | `train_figurine360_dmd_lora.sh` 运行前把 `wan_models/Wan2.2-TI2V-5B` symlink 到 merged teacher | 最小修改 Turbo 代码中的权重路径约定，且所有环境差异集中在脚本变量块 |
 
+### Stage B 剩余验证实现发现
+- 用户已在内网完成 gate-0：merged teacher 与 runtime load figurine360 LoRA 同 seed/prompt/首帧无差别，本次跳过 gate-0 复跑。
+- `wan2.2_fewstep.py` 原先只能加载 full `model.pt`；Stage B 需要加载 DMD 导出的 `figurine360_dmd_lora_rank64.safetensors` 或 trainer LoRA-only `model.pt`。
+- DMD LoRA 导出给 DiffSynth/ComfyUI 时使用 `.lora_A.default.weight`/`.lora_B.default.weight` 且 strip `model.`；Turbo runtime 加载时需要转回 `.lora_A.weight`/`.lora_B.weight`。
+- trainer 保存 EMA LoRA key 为 `generator_ema_lora`；恢复逻辑必须读取同名 key，否则断点继续训练后 EMA 会从断点重新初始化。
+- Stage B 验证拆成三类命令：5.2 Turbo/DiffSynth teacher alignment、训练后 12 holdout teacher50/student4 manifest、视频指标聚合。
+- DiffSynth 本地 TI2V alignment 不能使用示例里的 `ModelConfig(model_id=...)`，内网无外网应使用 `ModelConfig(path=...)` 指向 merged teacher 目录。
+- DiffSynth student 推理可直接加载 merged teacher 目录后 `pipe.load_lora(pipe.dit, figurine360_dmd_lora_rank64.safetensors)`，脚本入口为 `tools/diffsynth_wan22_dmd_lora_infer.py`。
+
 ## 需求
 - Stage A 在 MacBook CPU-only 环境完成离线可验证开发，不加载真实权重、不跑真实训练。
 - Stage B 在无外网 H100 环境只改脚本顶部变量块即可跑正式 LoRA SFT。

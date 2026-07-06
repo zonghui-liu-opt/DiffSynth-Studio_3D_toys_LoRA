@@ -49,6 +49,8 @@ def load_dmd_config_summary(path: str | Path) -> dict:
         "gan_loss_weight": float(cfg.get("gan_loss_weight", 0.0)),
         "load_video_latent": bool(cfg.get("load_video_latent", False)),
         "max_iters": int(cfg.get("max_iters", 0)),
+        "validation_interval": int(cfg.get("validation_interval", cfg.get("log_iters", 0))),
+        "dataloader_num_workers": int(cfg.get("dataloader_num_workers", 8)),
     }
 
 
@@ -65,6 +67,8 @@ def write_runtime_config(
     lr: float | None = None,
     lr_critic: float | None = None,
     ema_weight: float | None = None,
+    validation_interval: int | None = None,
+    dataloader_num_workers: int | None = None,
 ) -> dict:
     cfg = _load_yaml(template_path)
     cfg["h"] = int(height)
@@ -75,7 +79,11 @@ def write_runtime_config(
     cfg["image_or_video_shape"] = latent_shape(height, width, num_frames)
     cfg["max_iters"] = int(max_iters)
     cfg["log_iters"] = int(log_iters)
+    if validation_interval is not None:
+        cfg["validation_interval"] = int(validation_interval)
     cfg["batch_size"] = int(batch_size)
+    if dataloader_num_workers is not None:
+        cfg["dataloader_num_workers"] = int(dataloader_num_workers)
     if lr is not None:
         cfg["lr"] = float(lr)
     if lr_critic is not None:
@@ -101,6 +109,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--lr_critic", type=float, default=None)
     parser.add_argument("--ema_weight", type=float, default=None)
+    parser.add_argument("--validation_interval", type=int, default=None)
+    parser.add_argument("--dataloader_num_workers", type=int, default=None)
     return parser.parse_args()
 
 
