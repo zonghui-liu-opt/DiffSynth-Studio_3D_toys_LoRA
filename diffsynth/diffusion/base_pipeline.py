@@ -277,7 +277,8 @@ class BasePipeline(torch.nn.Module):
             if verbose >= 1:
                 print(f"{updated_num} tensors are patched by LoRA. You can use `pipe.clear_lora()` to clear all LoRA layers.")
         else:
-            lora_loader.fuse_lora_to_base_model(module, lora, alpha=alpha)
+            updated_num = lora_loader.fuse_lora_to_base_model(module, lora, alpha=alpha)
+        return updated_num
             
             
     def clear_lora(self, verbose=1):

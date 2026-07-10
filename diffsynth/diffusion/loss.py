@@ -1,5 +1,5 @@
 from .base_pipeline import BasePipeline
-import torch
+import torch, math, numbers
 
 
 def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
@@ -64,14 +64,133 @@ def FlowMatchSFTAudioVideoLoss(pipe: BasePipeline, **inputs):
 
 
 def DirectDistillLoss(pipe: BasePipeline, **inputs):
-    pipe.scheduler.set_timesteps(inputs["num_inference_steps"])
+    strict_mode = bool(
+        inputs.get("direct_distill_target_latent_key") is not None
+        or inputs.get("direct_distill_preserve_first_frame", False)
+        or inputs.get("direct_distill_exclude_first_frame_loss", False)
+    )
+    if not strict_mode:
+        # Keep the upstream DirectDistill path byte-for-byte equivalent when all
+        # new controls are disabled.
+        pipe.scheduler.set_timesteps(inputs["num_inference_steps"])
+        pipe.scheduler.training = True
+        models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+        for progress_id, timestep in enumerate(pipe.scheduler.timesteps):
+            timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
+            noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep, progress_id=progress_id)
+            inputs["latents"] = pipe.step(
+                pipe.scheduler, progress_id=progress_id, noise_pred=noise_pred, **inputs
+            )
+        return torch.nn.functional.mse_loss(
+            inputs["latents"].float(), inputs["input_latents"].float()
+        )
+
+    raw_num_inference_steps = inputs["num_inference_steps"]
+    if isinstance(raw_num_inference_steps, torch.Tensor) and raw_num_inference_steps.numel() == 1:
+        raw_num_inference_steps = raw_num_inference_steps.item()
+    if (
+        isinstance(raw_num_inference_steps, bool)
+        or not isinstance(raw_num_inference_steps, numbers.Real)
+        or not math.isfinite(float(raw_num_inference_steps))
+        or not float(raw_num_inference_steps).is_integer()
+    ):
+        raise ValueError("`num_inference_steps` must be an exact positive integer for strict DirectDistill.")
+    num_inference_steps = int(raw_num_inference_steps)
+    if num_inference_steps <= 0:
+        raise ValueError("`num_inference_steps` must be a positive integer for DirectDistillLoss.")
+
+    cfg_scale = float(inputs.get("cfg_scale", 1.0))
+    if cfg_scale != 1.0:
+        raise ValueError(
+            "DirectDistillLoss only supports CFG-free student rollout with `cfg_scale=1`; "
+            f"received {cfg_scale}."
+        )
+
+    target_latent_key = inputs.get("direct_distill_target_latent_key") or "input_latents"
+    if not isinstance(target_latent_key, str):
+        raise TypeError("`direct_distill_target_latent_key` must be a string when provided.")
+    if target_latent_key not in inputs:
+        raise KeyError(
+            f"DirectDistillLoss target latent key `{target_latent_key}` is missing from inputs."
+        )
+    target_latents = inputs[target_latent_key]
+    if not isinstance(inputs.get("latents"), torch.Tensor) or not isinstance(target_latents, torch.Tensor):
+        raise TypeError("DirectDistillLoss requires tensor `latents` and target latents.")
+    if inputs["latents"].shape != target_latents.shape:
+        raise ValueError(
+            "DirectDistillLoss student/target latent shapes must match, but received "
+            f"{tuple(inputs['latents'].shape)} and {tuple(target_latents.shape)}."
+        )
+
+    preserve_first_frame = bool(inputs.get("direct_distill_preserve_first_frame", False))
+    exclude_first_frame_loss = bool(inputs.get("direct_distill_exclude_first_frame_loss", False))
+    if preserve_first_frame or exclude_first_frame_loss:
+        if inputs["latents"].ndim != 5:
+            raise ValueError(
+                "DirectDistillLoss first-frame options require B,C,T,H,W latent tensors."
+            )
+        if inputs["latents"].shape[2] <= 1 and exclude_first_frame_loss:
+            raise ValueError(
+                "Cannot exclude the first frame from DirectDistillLoss when the latent has no remaining frames."
+            )
+
+    first_frame_latents = None
+    if preserve_first_frame:
+        first_frame_latents = inputs.get("first_frame_latents")
+        if not isinstance(first_frame_latents, torch.Tensor):
+            raise KeyError(
+                "`first_frame_latents` is required when `direct_distill_preserve_first_frame=True`."
+            )
+        expected_shape = inputs["latents"][:, :, 0:1].shape
+        if first_frame_latents.shape != expected_shape:
+            raise ValueError(
+                "`first_frame_latents` must match the first-frame latent slice, but received "
+                f"{tuple(first_frame_latents.shape)} and {tuple(expected_shape)}."
+            )
+        if first_frame_latents.dtype != inputs["latents"].dtype or first_frame_latents.device != inputs["latents"].device:
+            raise ValueError(
+                "`first_frame_latents` must have the same dtype and device as `latents` for bitwise preservation."
+            )
+        if not torch.equal(target_latents[:, :, 0:1], first_frame_latents):
+            raise ValueError(
+                "Teacher target first-frame latent is not bitwise equal to the TI2V input-image latent. "
+                "Check VAE tiling/resize settings and regenerate the teacher target."
+            )
+        # Wan2.2-TI2V normally performs this write in its fused-image pipeline unit.
+        # Repeating it here makes the DirectDistill rollout invariant explicit before step 0.
+        inputs["latents"][:, :, 0:1] = first_frame_latents
+
+    scheduler_kwargs = {}
+    if inputs.get("sigma_shift") is not None:
+        scheduler_kwargs["shift"] = float(inputs["sigma_shift"])
+    pipe.scheduler.set_timesteps(num_inference_steps, **scheduler_kwargs)
     pipe.scheduler.training = True
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     for progress_id, timestep in enumerate(pipe.scheduler.timesteps):
         timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
         noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep, progress_id=progress_id)
-        inputs["latents"] = pipe.step(pipe.scheduler, progress_id=progress_id, noise_pred=noise_pred, **inputs)
-    loss = torch.nn.functional.mse_loss(inputs["latents"].float(), inputs["input_latents"].float())
+        # The strict rollout never re-noises or blends in ground-truth latents between steps.
+        inputs["latents"] = pipe.scheduler.step(
+            noise_pred, pipe.scheduler.timesteps[progress_id], inputs["latents"]
+        )
+        if preserve_first_frame:
+            inputs["latents"][:, :, 0:1] = first_frame_latents
+
+    prediction = inputs["latents"]
+    if exclude_first_frame_loss:
+        prediction = prediction[:, :, 1:]
+        target_latents = target_latents[:, :, 1:]
+
+    scheduler_sigmas = getattr(pipe.scheduler, "sigmas", None)
+    pipe.direct_distill_last_stats = {
+        "num_inference_steps": len(pipe.scheduler.timesteps),
+        "timesteps": tuple(float(value) for value in pipe.scheduler.timesteps.detach().cpu()),
+        "sigmas": tuple(float(value) for value in scheduler_sigmas.detach().cpu())
+        if isinstance(scheduler_sigmas, torch.Tensor) else tuple(),
+        "latent_shape": tuple(inputs["latents"].shape),
+        "model_forward_count": len(pipe.scheduler.timesteps),
+    }
+    loss = torch.nn.functional.mse_loss(prediction.float(), target_latents.float())
     return loss
 
 

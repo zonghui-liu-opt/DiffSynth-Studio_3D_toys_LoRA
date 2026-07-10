@@ -266,6 +266,7 @@ class WanVideoPipeline(BasePipeline):
         # progress_bar
         progress_bar_cmd=tqdm,
         output_type: Literal["quantized", "floatpoint"] = "quantized",
+        return_latents: bool = False,
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
@@ -345,6 +346,10 @@ class WanVideoPipeline(BasePipeline):
         # post-denoising, pre-decoding processing logic
         for unit in self.post_units:
             inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+        if return_latents:
+            latents = inputs_shared["latents"]
+            self.load_models_to_device([])
+            return latents
         # Decode
         self.load_models_to_device(['vae'])
         if framewise_decoding:
@@ -526,6 +531,7 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
         pipe.load_models_to_device(self.onload_model_names)
         image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
         z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        z = z.to(dtype=latents.dtype, device=latents.device)
         latents[:, :, 0: 1] = z
         return {"latents": latents, "fuse_vae_embedding_in_latents": True, "first_frame_latents": z}
 
