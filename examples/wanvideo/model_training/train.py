@@ -1,4 +1,5 @@
 import torch, os, argparse, accelerate, warnings, math, numbers, hashlib
+from collections.abc import Mapping
 from PIL import Image
 from safetensors import safe_open
 from diffsynth.core import UnifiedDataset, load_state_dict
@@ -13,6 +14,9 @@ from diffsynth.core.data.operators import (
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+DIRECT_DISTILL_LATENT_METADATA_KEY = "_direct_distill_teacher_metadata"
 
 
 class LoadDirectDistillLatents(DataProcessingOperator):
@@ -93,6 +97,13 @@ class DirectDistillDataset(UnifiedDataset):
 
     def __getitem__(self, data_id):
         data = super().__getitem__(data_id)
+        teacher_latents = data.get("teacher_latent")
+        latent_metadata = getattr(teacher_latents, "_direct_distill_metadata", None)
+        if isinstance(latent_metadata, Mapping):
+            # Accelerate moves tensors to the training device with Tensor.to(),
+            # which drops arbitrary Python attributes. Keep provenance in the
+            # batch mapping so it survives workers, device placement, and DDP.
+            data[DIRECT_DISTILL_LATENT_METADATA_KEY] = dict(latent_metadata)
         if self.input_image_fallback_operator is None:
             return data
         if not _is_missing_metadata_value(data.get("input_image")):
@@ -395,12 +406,18 @@ class WanTrainingModule(DiffusionTrainingModule):
 
     @staticmethod
     def validate_direct_distill_latent_provenance(data, teacher_latents):
-        metadata = getattr(teacher_latents, "_direct_distill_metadata", {}) or {}
         if not any(
             not _is_missing_metadata_value(data.get(key)) and data.get(key) != ""
             for key in ("sample_id", "teacher_fingerprint", "source_fingerprint")
         ):
             return
+        metadata = data.get(DIRECT_DISTILL_LATENT_METADATA_KEY)
+        if not isinstance(metadata, Mapping):
+            # Compatibility for direct calls that have not passed through the
+            # strict DirectDistillDataset/Accelerate dataloader path.
+            metadata = getattr(teacher_latents, "_direct_distill_metadata", {}) or {}
+        if not isinstance(metadata, Mapping):
+            metadata = {}
         for key in (
             "sample_id", "teacher_fingerprint", "source_fingerprint", "seed", "rand_device"
         ):

@@ -1,12 +1,14 @@
+import hashlib
 from types import SimpleNamespace
 
 import pytest
 import torch
+from accelerate.utils import send_to_device
 from PIL import Image
 from safetensors.torch import save_file
 
-from diffsynth.core import UnifiedDataset
 from examples.wanvideo.model_training.train import (
+    DIRECT_DISTILL_LATENT_METADATA_KEY,
     DirectDistillDataset,
     LoadDirectDistillInputImage,
     LoadDirectDistillLatents,
@@ -187,7 +189,17 @@ def test_safetensors_loader_and_special_dataset_operators_round_trip(tmp_path):
     Image.new("RGB", (24, 20), color="green").save(image_path)
     latent_path = tmp_path / "teacher.safetensors"
     expected = torch.randn(1, 4, 3, 2, 2)
-    save_file({"latents": expected}, latent_path)
+    prompt = "turntable"
+    provenance = {
+        "object_id": "object-a",
+        "sample_id": "sample-a",
+        "seed": "1",
+        "rand_device": "cpu",
+        "teacher_fingerprint": "teacher-a",
+        "source_fingerprint": "source-a",
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+    }
+    save_file({"latents": expected}, latent_path, metadata=provenance)
 
     loader = LoadDirectDistillLatents()
     actual = loader(latent_path)
@@ -201,7 +213,9 @@ def test_safetensors_loader_and_special_dataset_operators_round_trip(tmp_path):
 
     metadata_path = tmp_path / "metadata.csv"
     metadata_path.write_text(
-        "input_image,teacher_latent,prompt\nfirst.png,teacher.safetensors,turntable\n",
+        "input_image,teacher_latent,prompt,sample_id,teacher_fingerprint,"
+        "source_fingerprint,seed,rand_device\n"
+        "first.png,teacher.safetensors,turntable,sample-a,teacher-a,source-a,1,cpu\n",
         encoding="utf-8",
     )
     args = SimpleNamespace(
@@ -215,7 +229,7 @@ def test_safetensors_loader_and_special_dataset_operators_round_trip(tmp_path):
         direct_distill_exclude_first_frame_loss=True,
         direct_distill_target_latent_key="input_latents",
     )
-    dataset = UnifiedDataset(
+    dataset = DirectDistillDataset(
         base_path=str(tmp_path),
         metadata_path=str(metadata_path),
         data_file_keys=("input_image", "teacher_latent"),
@@ -225,6 +239,24 @@ def test_safetensors_loader_and_special_dataset_operators_round_trip(tmp_path):
     row = dataset[0]
     assert row["input_image"].size == (16, 16)
     assert torch.equal(row["teacher_latent"], expected)
+    assert row[DIRECT_DISTILL_LATENT_METADATA_KEY] == provenance
+
+    moved_row = send_to_device(row, torch.device("meta"))
+    assert not hasattr(moved_row["teacher_latent"], "_direct_distill_metadata")
+    assert moved_row[DIRECT_DISTILL_LATENT_METADATA_KEY] == provenance
+    WanTrainingModule.validate_direct_distill_latent_provenance(
+        moved_row, moved_row["teacher_latent"]
+    )
+
+    mismatched_row = dict(moved_row)
+    mismatched_row[DIRECT_DISTILL_LATENT_METADATA_KEY] = {
+        **provenance,
+        "sample_id": "wrong-sample",
+    }
+    with pytest.raises(ValueError, match="sample_id.*mismatch"):
+        WanTrainingModule.validate_direct_distill_latent_provenance(
+            mismatched_row, moved_row["teacher_latent"]
+        )
 
     extra_key_path = tmp_path / "extra-key.safetensors"
     save_file({"latents": expected, "extra": torch.ones(1)}, extra_key_path)

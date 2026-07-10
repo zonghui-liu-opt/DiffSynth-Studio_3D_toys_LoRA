@@ -122,6 +122,7 @@ bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figu
 - **target/student shape 不一致**：teacher 准备和训练的 height/width/num_frames 不一致；重新生成对应 teacher latent。
 - **CFG 报错**：student metadata 的 `cfg_scale` 必须为 1；CFG=5 只属于 teacher。
 - **首帧报错**：缓存 PNG 与 teacher latent 不匹配，或坏产物未被清理；先运行准备脚本校验并重生成该样本。
+- **Teacher latent metadata mismatch**：`.safetensors` 必须用 `safetensors.safe_open` 检查，不能用 `torch.load`。若 `safe_open(...).metadata()` 含完整 provenance，请确认已更新到包含 Accelerate metadata sidecar 修复的版本；若 metadata 本身缺字段，重跑当前 `prepare-smoke`/`prepare` 让脚本隔离并重建旧产物。
 - **0 个 LoRA 层匹配**：figurine 或 DirectDistill LoRA 与 Wan2.2-TI2V-5B 层名不匹配；不要忽略启动断言。
 - **没有图表**：确认 `PLOT_RUN_OUTPUT/metrics.jsonl` 非空（默认是有效的正式或续训输出目录），并在离线环境预装 matplotlib。
 
