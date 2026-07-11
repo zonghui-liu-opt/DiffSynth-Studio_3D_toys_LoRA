@@ -139,7 +139,7 @@ CUDA_VISIBLE_DEVICES=0 START_INDEX=0 END_INDEX=10 \
 bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figurine360-Test.sh all
 ```
 
-`END_INDEX` 为开区间，留空表示表尾；默认 `SKIP_EXISTING=1`，存在 `validation.json` 的样本会跳过。当前 `all` 为稳妥的串行封装，每条样本都会重新加载 5B 模型，因此先用 `one` 验证路径、显存和画质，再决定整表范围。
+`END_INDEX` 为开区间，留空表示表尾；默认 `SKIP_EXISTING=1`，存在 `validation.json` 的样本会跳过。`all` 只启动一个 Python 进程并只加载一次模型：先在仅融合 figurine360 LoRA 的状态下生成选中样本的全部 teacher latent，再融合一次 DirectDistill LoRA 并连续生成全部 student、视频和报告。这样保证 teacher 不受 DirectDistill LoRA 污染，同时避免逐样本重新加载 5B 模型。建议仍先用 `one` 验证路径、显存和画质，再决定整表范围。
 
 ## 常见错误
 

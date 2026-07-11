@@ -87,6 +87,12 @@ def test_custom_test_shell_help_and_syntax():
     assert "input_image,prompt" in result.stdout
     assert "480x832@81" in result.stdout
     assert "student 固定为 4 steps/CFG 1/shift 5" in result.stdout
+    assert "模型只加载一次" in result.stdout
+
+    script = TEST_SHELL.read_text(encoding="utf-8")
+    assert '--batch_start "${START_INDEX}"' in script
+    assert '--batch_end "${end}"' in script
+    assert "每条样本都会重新加载" not in script
 
 
 def test_custom_test_shell_validates_absolute_input_images(tmp_path):

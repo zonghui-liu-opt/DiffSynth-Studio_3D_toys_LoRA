@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image, ImageDraw
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 
 def require_local_file(path, label):
@@ -58,15 +58,17 @@ def _resolve_metadata_path(value, base_path):
     return path.resolve()
 
 
-def load_sample_from_metadata(metadata_path, sample_index=0, dataset_base_path=None):
+def read_metadata_rows(metadata_path):
     metadata_path = require_local_file(metadata_path, "Metadata CSV")
     with metadata_path.open("r", encoding="utf-8-sig", newline="") as file:
         rows = list(csv.DictReader(file))
     if not rows:
         raise ValueError(f"Metadata CSV has no rows: {metadata_path}")
-    if sample_index < 0 or sample_index >= len(rows):
-        raise IndexError(f"sample_index={sample_index} is outside [0, {len(rows) - 1}].")
-    row = rows[sample_index]
+    return metadata_path, rows
+
+
+def load_sample_from_row(row, metadata_path, dataset_base_path=None):
+    metadata_path = Path(metadata_path).expanduser().resolve()
     base_path = Path(dataset_base_path).expanduser().resolve() if dataset_base_path else metadata_path.parent
     input_image = row.get("input_image")
     if input_image:
@@ -77,6 +79,13 @@ def load_sample_from_metadata(metadata_path, sample_index=0, dataset_base_path=N
         image = load_first_video_frame(video_path)
         image_path = video_path
     return row, image, image_path
+
+
+def load_sample_from_metadata(metadata_path, sample_index=0, dataset_base_path=None):
+    metadata_path, rows = read_metadata_rows(metadata_path)
+    if sample_index < 0 or sample_index >= len(rows):
+        raise IndexError(f"sample_index={sample_index} is outside [0, {len(rows) - 1}].")
+    return load_sample_from_row(rows[sample_index], metadata_path, dataset_base_path)
 
 
 @torch.no_grad()
@@ -175,7 +184,7 @@ def build_pipeline(model_paths, tokenizer_path, device="cuda", torch_dtype="bflo
     )
 
 
-def validate(args):
+def validate_student_schedule(args):
     if args.student_num_inference_steps != 4:
         raise ValueError("Student validation requires exactly 4 denoising steps.")
     if args.student_cfg_scale != 1:
@@ -183,17 +192,8 @@ def validate(args):
     if args.student_sigma_shift != 5:
         raise ValueError("Student validation requires sigma_shift=5.")
 
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if args.metadata_path:
-        row, input_image, input_source = load_sample_from_metadata(
-            args.metadata_path, args.sample_index, args.dataset_base_path
-        )
-    else:
-        row = {}
-        input_source = require_local_file(args.input_image, "Input image")
-        input_image = Image.open(input_source).convert("RGB")
 
+def build_sample(args, row, input_image, input_source):
     def value(name, cli_value, cast):
         raw = row.get(name)
         return cast(raw) if raw not in (None, "") else cast(cli_value)
@@ -221,53 +221,108 @@ def validate(args):
     tiled = str(row.get("tiled", str(int(args.tiled)))).strip().lower() in ("1", "true", "yes")
     tile_size = pair_value("tile_size", (30, 52))
     tile_stride = pair_value("tile_stride", (15, 26))
+    return {
+        "input_image": input_image,
+        "input_source": input_source,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "seed": seed,
+        "rand_device": rand_device,
+        "height": height,
+        "width": width,
+        "num_frames": num_frames,
+        "teacher_steps": teacher_steps,
+        "teacher_cfg": teacher_cfg,
+        "teacher_shift": teacher_shift,
+        "tiled": tiled,
+        "tile_size": tile_size,
+        "tile_stride": tile_stride,
+    }
 
+
+def load_single_sample(args):
+    if args.metadata_path:
+        row, input_image, input_source = load_sample_from_metadata(
+            args.metadata_path, args.sample_index, args.dataset_base_path
+        )
+    else:
+        row = {}
+        input_source = require_local_file(args.input_image, "Input image")
+        input_image = Image.open(input_source).convert("RGB")
+    return build_sample(args, row, input_image, input_source)
+
+
+def sample_pipeline_kwargs(sample):
+    return {
+        "prompt": sample["prompt"],
+        "negative_prompt": sample["negative_prompt"],
+        "input_image": sample["input_image"],
+        "seed": sample["seed"],
+        "rand_device": sample["rand_device"],
+        "height": sample["height"],
+        "width": sample["width"],
+        "num_frames": sample["num_frames"],
+        "tiled": sample["tiled"],
+        "tile_size": sample["tile_size"],
+        "tile_stride": sample["tile_stride"],
+        "return_latents": True,
+        "progress_bar_cmd": lambda values: values,
+    }
+
+
+def load_teacher_pipeline(args):
     figurine_lora = require_local_file(args.figurine360_lora, "figurine360 LoRA")
     direct_distill_lora = require_local_file(args.direct_distill_lora, "DirectDistill LoRA")
     if figurine_lora == direct_distill_lora:
         raise ValueError("figurine360 and DirectDistill LoRA paths must be different files.")
+
     pipe = build_pipeline(
         args.model_path, args.tokenizer_path, args.device, args.torch_dtype
     )
     figurine_matches = pipe.load_lora(pipe.dit, str(figurine_lora), hotload=False)
     if figurine_matches is None or figurine_matches <= 0:
         raise RuntimeError("figurine360 LoRA matched zero Wan2.2-TI2V-5B modules.")
-    shared = {
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "input_image": input_image,
-        "seed": seed,
-        "rand_device": rand_device,
-        "height": height,
-        "width": width,
-        "num_frames": num_frames,
-        "tiled": tiled,
-        "tile_size": tile_size,
-        "tile_stride": tile_stride,
-        "return_latents": True,
-        "progress_bar_cmd": lambda values: values,
-    }
+    return pipe, direct_distill_lora
 
-    teacher_latents = pipe(
-        **shared,
-        num_inference_steps=teacher_steps,
-        cfg_scale=teacher_cfg,
-        sigma_shift=teacher_shift,
-    )
-    validate_latent_tensor(teacher_latents, "Teacher")
-    teacher_frames = decode_latents(
-        pipe, teacher_latents, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
-    )
 
+def fuse_direct_distill_lora(pipe, direct_distill_lora):
     # The second fusion creates base + frozen figurine360 + distilled adapter.
     direct_distill_matches = pipe.load_lora(
         pipe.dit, str(direct_distill_lora), hotload=False
     )
     if direct_distill_matches is None or direct_distill_matches <= 0:
         raise RuntimeError("DirectDistill LoRA matched zero Wan2.2-TI2V-5B modules.")
+
+
+def run_teacher(pipe, sample):
+    teacher_latents = pipe(
+        **sample_pipeline_kwargs(sample),
+        num_inference_steps=sample["teacher_steps"],
+        cfg_scale=sample["teacher_cfg"],
+        sigma_shift=sample["teacher_shift"],
+    )
+    validate_latent_tensor(teacher_latents, "Teacher")
+    return teacher_latents
+
+
+def finish_student_validation(
+    pipe, args, sample, teacher_latents, output_dir, teacher_frames=None
+):
+    output_dir = Path(output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    validate_latent_tensor(teacher_latents, "Teacher")
+    if teacher_frames is None:
+        teacher_frames = decode_latents(
+            pipe,
+            teacher_latents,
+            tiled=sample["tiled"],
+            tile_size=sample["tile_size"],
+            tile_stride=sample["tile_stride"],
+        )
+
     student_latents, student_forward_count = run_pipeline_with_forward_count(
         pipe,
-        **shared,
+        **sample_pipeline_kwargs(sample),
         num_inference_steps=args.student_num_inference_steps,
         cfg_scale=args.student_cfg_scale,
         sigma_shift=args.student_sigma_shift,
@@ -282,10 +337,17 @@ def validate(args):
         expected_shape=teacher_latents.shape,
         expected_dtype=teacher_latents.dtype,
     )
+    teacher_latents = teacher_latents.to(
+        device=student_latents.device, dtype=student_latents.dtype
+    )
     if not torch.equal(teacher_latents[:, :, :1], student_latents[:, :, :1]):
         raise RuntimeError("Teacher/student first-frame latents are not bitwise identical.")
     student_frames = decode_latents(
-        pipe, student_latents, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
+        pipe,
+        student_latents,
+        tiled=sample["tiled"],
+        tile_size=sample["tile_size"],
+        tile_stride=sample["tile_stride"],
     )
     paired_frames = compose_side_by_side(teacher_frames, student_frames)
 
@@ -303,14 +365,18 @@ def validate(args):
     if not math.isfinite(mse):
         raise RuntimeError("Teacher/student non-first-frame latent MSE is not finite.")
     report = {
-        "input_source": str(input_source),
-        "prompt": prompt,
-        "seed": seed,
-        "rand_device": rand_device,
-        "height": height,
-        "width": width,
-        "num_frames": num_frames,
-        "teacher": {"steps": teacher_steps, "cfg_scale": teacher_cfg, "sigma_shift": teacher_shift},
+        "input_source": str(sample["input_source"]),
+        "prompt": sample["prompt"],
+        "seed": sample["seed"],
+        "rand_device": sample["rand_device"],
+        "height": sample["height"],
+        "width": sample["width"],
+        "num_frames": sample["num_frames"],
+        "teacher": {
+            "steps": sample["teacher_steps"],
+            "cfg_scale": sample["teacher_cfg"],
+            "sigma_shift": sample["teacher_shift"],
+        },
         "student": {
             "steps": 4,
             "cfg_scale": 1,
@@ -326,6 +392,125 @@ def validate(args):
         json.dump(report, file, indent=2, ensure_ascii=False, allow_nan=False)
         file.write("\n")
     return report
+
+
+def validate(args):
+    validate_student_schedule(args)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sample = load_single_sample(args)
+    pipe, direct_distill_lora = load_teacher_pipeline(args)
+    teacher_latents = run_teacher(pipe, sample)
+    teacher_frames = decode_latents(
+        pipe,
+        teacher_latents,
+        tiled=sample["tiled"],
+        tile_size=sample["tile_size"],
+        tile_stride=sample["tile_stride"],
+    )
+    fuse_direct_distill_lora(pipe, direct_distill_lora)
+    return finish_student_validation(
+        pipe, args, sample, teacher_latents, output_dir, teacher_frames=teacher_frames
+    )
+
+
+def select_batch_indices(row_count, start, end, output_dir, skip_existing=True):
+    start = 0 if start is None else start
+    end = row_count if end is None else end
+    if start < 0 or end < 0 or start >= end or end > row_count:
+        raise ValueError(
+            f"Batch range [{start}, {end}) is invalid for metadata with {row_count} rows."
+        )
+    requested = list(range(start, end))
+    if not skip_existing:
+        return requested, []
+    skipped = [
+        index
+        for index in requested
+        if (Path(output_dir) / f"sample-{index}" / "validation.json").is_file()
+    ]
+    skipped_set = set(skipped)
+    return [index for index in requested if index not in skipped_set], skipped
+
+
+def validate_batch(args):
+    validate_student_schedule(args)
+    if not args.metadata_path:
+        raise ValueError("Batch validation requires --metadata_path.")
+
+    metadata_path, rows = read_metadata_rows(args.metadata_path)
+    output_root = Path(args.output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    indices, skipped = select_batch_indices(
+        len(rows),
+        args.batch_start,
+        args.batch_end,
+        output_root,
+        skip_existing=args.skip_existing,
+    )
+    summary = {
+        "metadata_path": str(metadata_path),
+        "batch_start": 0 if args.batch_start is None else args.batch_start,
+        "batch_end": len(rows) if args.batch_end is None else args.batch_end,
+        "selected": len(indices),
+        "skipped": skipped,
+        "completed": [],
+        "model_load_count": 0,
+        "figurine_lora_fusion_count": 0,
+        "direct_distill_lora_fusion_count": 0,
+    }
+    if not indices:
+        with (output_root / "batch_summary.json").open("w", encoding="utf-8") as file:
+            json.dump(summary, file, indent=2, ensure_ascii=False, allow_nan=False)
+            file.write("\n")
+        return summary
+
+    pipe, direct_distill_lora = load_teacher_pipeline(args)
+    summary["model_load_count"] = 1
+    summary["figurine_lora_fusion_count"] = 1
+
+    # Phase 1: all teachers must run before the DirectDistill LoRA is fused.
+    for index in indices:
+        print(f"[teacher] sample {index}", flush=True)
+        row, image, source = load_sample_from_row(
+            rows[index], metadata_path, args.dataset_base_path
+        )
+        sample = build_sample(args, row, image, source)
+        teacher_latents = run_teacher(pipe, sample)
+        sample_dir = output_root / f"sample-{index}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        save_file(
+            {"latents": teacher_latents.detach().cpu().contiguous()},
+            sample_dir / "teacher_latents.safetensors",
+        )
+        del teacher_latents, sample, image
+
+    # Phase 2: fuse once, then run every student without rebuilding the pipeline.
+    fuse_direct_distill_lora(pipe, direct_distill_lora)
+    summary["direct_distill_lora_fusion_count"] = 1
+    for index in indices:
+        print(f"[student] sample {index}", flush=True)
+        row, image, source = load_sample_from_row(
+            rows[index], metadata_path, args.dataset_base_path
+        )
+        sample = build_sample(args, row, image, source)
+        sample_dir = output_root / f"sample-{index}"
+        teacher_tensors = load_file(
+            sample_dir / "teacher_latents.safetensors", device="cpu"
+        )
+        if set(teacher_tensors) != {"latents"}:
+            raise ValueError(
+                f"Teacher latent file for sample {index} must contain only `latents`."
+            )
+        finish_student_validation(
+            pipe, args, sample, teacher_tensors["latents"], sample_dir
+        )
+        summary["completed"].append(index)
+        with (output_root / "batch_summary.json").open("w", encoding="utf-8") as file:
+            json.dump(summary, file, indent=2, ensure_ascii=False, allow_nan=False)
+            file.write("\n")
+        del teacher_tensors, sample, image
+    return summary
 
 
 def build_parser():
@@ -344,6 +529,24 @@ def build_parser():
     source.add_argument("--input_image")
     parser.add_argument("--dataset_base_path", default=None)
     parser.add_argument("--sample_index", type=int, default=0)
+    parser.add_argument(
+        "--batch_start",
+        type=int,
+        default=None,
+        help="Inclusive metadata index for single-process batch validation.",
+    )
+    parser.add_argument(
+        "--batch_end",
+        type=int,
+        default=None,
+        help="Exclusive metadata index for single-process batch validation.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip batch samples whose validation.json already exists.",
+    )
     parser.add_argument("--prompt", default="a studio figurine rotating through a complete 360 degree turn")
     parser.add_argument("--negative_prompt", default="overexposed, flicker, incomplete rotation, deformation")
     parser.add_argument("--seed", type=int, default=1)
@@ -372,7 +575,9 @@ def build_parser():
 def main():
     parser = build_parser()
     try:
-        report = validate(parser.parse_args())
+        args = parser.parse_args()
+        batch_mode = args.batch_start is not None or args.batch_end is not None
+        report = validate_batch(args) if batch_mode else validate(args)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         parser.exit(1, f"error: {error}\n")
     print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))

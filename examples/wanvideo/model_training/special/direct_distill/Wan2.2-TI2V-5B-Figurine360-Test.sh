@@ -176,21 +176,45 @@ run_one() {
 run_all() {
   doctor
   require_nonnegative_integer "START_INDEX" "${START_INDEX}"
-  local count end index
+  local count end skip_flag tile_flag
   count="$(metadata_count)"
   end="${END_INDEX:-${count}}"
   require_nonnegative_integer "END_INDEX" "${end}"
   (( START_INDEX < end )) || die "需要满足 START_INDEX < END_INDEX"
   (( end <= count )) || die "END_INDEX=${end} 越界，测试集共有 ${count} 条"
 
-  echo "将串行运行 [${START_INDEX}, ${end})；每条样本都会重新加载 5B 模型。"
-  for ((index = START_INDEX; index < end; index++)); do
-    if [[ "${SKIP_EXISTING}" == "1" && -f "${TEST_OUTPUT}/sample-${index}/validation.json" ]]; then
-      echo "跳过已完成样本 ${index}"
-      continue
-    fi
-    run_sample "${index}"
-  done
+  skip_flag="--skip-existing"
+  [[ "${SKIP_EXISTING}" == "1" ]] || skip_flag="--no-skip-existing"
+  tile_flag="--no-tiled"
+  [[ "${VAE_TILED}" != "1" ]] || tile_flag="--tiled"
+  echo "单进程批处理 [${START_INDEX}, ${end})：模型加载一次，figurine/DirectDistill LoRA 各融合一次。"
+  python3 "${VALIDATE_PY}" \
+    "${MODEL_PATH_ARGS[@]}" \
+    --tokenizer_path "${TOKENIZER_PATH}" \
+    --figurine360_lora "${FIGURINE360_LORA}" \
+    --direct_distill_lora "${DIRECT_DISTILL_LORA}" \
+    --metadata_path "${TEST_METADATA}" \
+    --dataset_base_path "$(dirname "${TEST_METADATA}")" \
+    --batch_start "${START_INDEX}" \
+    --batch_end "${end}" \
+    "${skip_flag}" \
+    --negative_prompt "${NEGATIVE_PROMPT}" \
+    --seed "${SEED}" \
+    --rand_device "${RAND_DEVICE}" \
+    --height "${HEIGHT}" \
+    --width "${WIDTH}" \
+    --num_frames "${NUM_FRAMES}" \
+    --teacher_num_inference_steps "${TEACHER_STEPS}" \
+    --teacher_cfg_scale "${TEACHER_CFG}" \
+    --teacher_sigma_shift "${TEACHER_SHIFT}" \
+    --student_num_inference_steps 4 \
+    --student_cfg_scale 1 \
+    --student_sigma_shift 5 \
+    --fps "${FPS}" \
+    --device "${DEVICE}" \
+    --torch_dtype "${TORCH_DTYPE}" \
+    "${tile_flag}" \
+    --output_dir "${TEST_OUTPUT}"
 }
 
 usage() {
@@ -200,7 +224,7 @@ usage() {
 COMMAND:
   doctor  检查本地模型、两份 LoRA、依赖和 input_image,prompt 测试集
   one     推理 SAMPLE_INDEX 指定的一条，并生成 teacher/student 对比
-  all     串行推理 [START_INDEX, END_INDEX)，默认从第 0 条到表尾
+  all     单进程批量推理 [START_INDEX, END_INDEX)，默认从第 0 条到表尾
 
 必要路径变量:
   DIT_PATHS_JSON TEXT_ENCODER_PATH VAE_PATH TOKENIZER_PATH
@@ -212,6 +236,7 @@ COMMAND:
 
 测试集只有 input_image,prompt 两列时，默认参数为 480x832@81、seed=1；
 teacher=50 steps/CFG 5/shift 5，student 固定为 4 steps/CFG 1/shift 5。
+all 先完成全部 teacher，再融合一次 DirectDistill LoRA 并完成全部 student；模型只加载一次。
 EOF
 }
 
