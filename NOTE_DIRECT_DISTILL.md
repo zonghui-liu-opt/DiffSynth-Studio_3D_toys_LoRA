@@ -116,6 +116,31 @@ bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figu
 
 `global_video_tokens` 每视频只计一次；`global_model_tokens=global_video_tokens×4`；`global_tokens_per_hour` 指 model tokens/hour。多卡计数求和，step time 和显存取各 rank 最大值；计时包含 forward/backward/optimizer，不含数据准备、日志、checkpoint 和验证。若要同时启用 TensorBoard，执行训练命令时设置 `ENABLE_TENSORBOARD=1`；默认只写离线 JSONL。
 
+## 8. 自定义首帧测试集
+
+测试集若只有 `input_image,prompt` 两列，且 `input_image` 是首帧图片绝对路径，使用独立入口：
+
+```bash
+TEST_METADATA=/绝对路径/test/metadata.csv \
+DIRECT_DISTILL_LORA=/绝对路径/step-200.safetensors \
+TEST_OUTPUT=/绝对路径/test-output \
+bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figurine360-Test.sh doctor
+
+CUDA_VISIBLE_DEVICES=0 SAMPLE_INDEX=0 \
+bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figurine360-Test.sh one
+```
+
+脚本默认按 `480x832@81`、seed=1 运行；teacher 为 50 steps/CFG 5/shift 5，student 强制为 4 steps/CFG 1/shift 5。输出位于 `TEST_OUTPUT/sample-N/`，包括 teacher/student/并排 MP4、两份 latent 和 `validation.json`。
+
+需要跑整表或断点区间时使用：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 START_INDEX=0 END_INDEX=10 \
+bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figurine360-Test.sh all
+```
+
+`END_INDEX` 为开区间，留空表示表尾；默认 `SKIP_EXISTING=1`，存在 `validation.json` 的样本会跳过。当前 `all` 为稳妥的串行封装，每条样本都会重新加载 5B 模型，因此先用 `one` 验证路径、显存和画质，再决定整表范围。
+
 ## 常见错误
 
 - **程序尝试联网**：模型或 tokenizer 路径不是本地有效路径。运行 `doctor`，不要填写 model ID。

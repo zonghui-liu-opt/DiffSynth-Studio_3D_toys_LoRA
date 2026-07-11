@@ -12,6 +12,7 @@ SHELL = (
     / "direct_distill"
     / "Wan2.2-TI2V-5B-Figurine360.sh"
 )
+TEST_SHELL = SHELL.with_name("Wan2.2-TI2V-5B-Figurine360-Test.sh")
 
 
 def run_sourced_shell(body: str) -> subprocess.CompletedProcess[str]:
@@ -71,3 +72,71 @@ def test_shell_has_separate_smoke_and_formal_validation_checkpoints():
     assert "VALIDATION_LORA_CHECKPOINT=" not in script.replace(
         "SMOKE_VALIDATION_LORA_CHECKPOINT=", ""
     ).replace("FORMAL_VALIDATION_LORA_CHECKPOINT=", "")
+
+
+def test_custom_test_shell_help_and_syntax():
+    subprocess.run(["bash", "-n", str(TEST_SHELL)], cwd=ROOT, check=True)
+    result = subprocess.run(
+        ["bash", str(TEST_SHELL), "--help"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "input_image,prompt" in result.stdout
+    assert "480x832@81" in result.stdout
+    assert "student 固定为 4 steps/CFG 1/shift 5" in result.stdout
+
+
+def test_custom_test_shell_validates_absolute_input_images(tmp_path):
+    image = tmp_path / "first.png"
+    image.touch()
+    metadata = tmp_path / "metadata.csv"
+    metadata.write_text(
+        f'input_image,prompt\n"{image}","turn, 360 degrees"\n',
+        encoding="utf-8",
+    )
+    command = f"""
+shell_path="$1"
+metadata_path="$2"
+set -- help
+source "$shell_path" >/dev/null
+TEST_METADATA="$metadata_path"
+metadata_count
+"""
+    result = subprocess.run(
+        ["bash", "-c", command, "_", str(TEST_SHELL), str(metadata)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "1"
+
+
+def test_custom_test_shell_rejects_relative_input_images(tmp_path):
+    metadata = tmp_path / "metadata.csv"
+    metadata.write_text(
+        "input_image,prompt\nfirst.png,turntable\n",
+        encoding="utf-8",
+    )
+    command = f"""
+shell_path="$1"
+metadata_path="$2"
+set -- help
+source "$shell_path" >/dev/null
+TEST_METADATA="$metadata_path"
+metadata_count
+"""
+    result = subprocess.run(
+        ["bash", "-c", command, "_", str(TEST_SHELL), str(metadata)],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "不是绝对路径" in result.stderr
