@@ -1,4 +1,5 @@
 from .base_pipeline import BasePipeline
+from dataclasses import replace
 import torch, math, numbers
 
 
@@ -166,9 +167,43 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
     pipe.scheduler.set_timesteps(num_inference_steps, **scheduler_kwargs)
     pipe.scheduler.training = True
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+    bsa_context = inputs.get("bsa_context")
+    dense_anchor_weight = float(inputs.get("bsa_dense_anchor_weight", 0.0))
+    dense_anchor_interval = int(inputs.get("bsa_dense_anchor_interval", 1))
+    if dense_anchor_weight < 0 or dense_anchor_interval <= 0:
+        raise ValueError("BSA dense anchor weight/interval are invalid.")
+    anchor_active = bool(
+        bsa_context is not None
+        and dense_anchor_weight > 0
+        and bsa_context.optimizer_step % dense_anchor_interval == 0
+    )
+    anchor_progress = bsa_context.optimizer_step % num_inference_steps if anchor_active else None
+    dense_anchor_loss = None
     for progress_id, timestep in enumerate(pipe.scheduler.timesteps):
         timestep = timestep.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
-        noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep, progress_id=progress_id)
+        model_inputs = inputs
+        if inputs.get("bsa_context") is not None:
+            model_inputs = dict(inputs)
+            model_inputs["bsa_context"] = replace(
+                inputs["bsa_context"], denoise_progress_id=progress_id
+            )
+        noise_pred = pipe.model_fn(
+            **models, **model_inputs, timestep=timestep, progress_id=progress_id
+        )
+        if anchor_active and progress_id == anchor_progress:
+            dense_inputs = dict(model_inputs)
+            dense_inputs["bsa_context"] = replace(
+                model_inputs["bsa_context"], sparsity=0.0, top_k=None
+            )
+            with torch.no_grad():
+                dense_prediction = pipe.model_fn(
+                    **models, **dense_inputs, timestep=timestep, progress_id=progress_id
+                )
+            sparse_anchor = noise_pred[:, :, 1:] if exclude_first_frame_loss else noise_pred
+            dense_anchor = dense_prediction[:, :, 1:] if exclude_first_frame_loss else dense_prediction
+            dense_anchor_loss = torch.nn.functional.mse_loss(
+                sparse_anchor.float(), dense_anchor.float()
+            ) / dense_anchor.float().square().mean().clamp_min(1e-6)
         # The strict rollout never re-noises or blends in ground-truth latents between steps.
         inputs["latents"] = pipe.scheduler.step(
             noise_pred, pipe.scheduler.timesteps[progress_id], inputs["latents"]
@@ -188,10 +223,15 @@ def DirectDistillLoss(pipe: BasePipeline, **inputs):
         "sigmas": tuple(float(value) for value in scheduler_sigmas.detach().cpu())
         if isinstance(scheduler_sigmas, torch.Tensor) else tuple(),
         "latent_shape": tuple(inputs["latents"].shape),
-        "model_forward_count": len(pipe.scheduler.timesteps),
+        "model_forward_count": len(pipe.scheduler.timesteps) + int(anchor_active),
+        "dense_anchor_active": anchor_active,
+        "dense_anchor_loss": None if dense_anchor_loss is None else dense_anchor_loss.detach(),
     }
-    loss = torch.nn.functional.mse_loss(prediction.float(), target_latents.float())
-    return loss
+    endpoint_loss = torch.nn.functional.mse_loss(prediction.float(), target_latents.float())
+    pipe.direct_distill_last_stats["endpoint_loss"] = endpoint_loss.detach()
+    if dense_anchor_loss is None:
+        return endpoint_loss
+    return endpoint_loss + dense_anchor_weight * dense_anchor_loss
 
 
 class TrajectoryImitationLoss(torch.nn.Module):

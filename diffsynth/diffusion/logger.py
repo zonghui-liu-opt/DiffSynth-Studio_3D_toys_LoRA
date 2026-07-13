@@ -187,9 +187,21 @@ class ModelLogger:
         accelerator.wait_for_everyone()
         state_dict = accelerator.get_state_dict(model)
         if accelerator.is_main_process:
-            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+            unwrapped_model = accelerator.unwrap_model(model)
+            state_dict = unwrapped_model.export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
             state_dict = self.state_dict_converter(state_dict)
             os.makedirs(self.output_path, exist_ok=True)
+            manifest_fn = getattr(unwrapped_model, "bsa_checkpoint_manifest", None)
+            manifest = manifest_fn() if callable(manifest_fn) else None
+            if manifest is not None:
+                from diffsynth.models.wan_video_bsa import save_composite_bsa_checkpoint
+
+                checkpoint_path = os.path.join(
+                    self.output_path,
+                    f"checkpoint-step-{int(manifest['completed_optimizer_steps']):07d}",
+                )
+                save_composite_bsa_checkpoint(state_dict, checkpoint_path, manifest)
+                return
             path = os.path.join(self.output_path, file_name)
             if self.enable_metrics_jsonl and os.path.exists(path):
                 raise FileExistsError(

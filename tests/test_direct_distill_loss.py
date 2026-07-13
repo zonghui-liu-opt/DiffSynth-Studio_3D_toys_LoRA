@@ -3,6 +3,7 @@ import torch
 
 from diffsynth.diffusion.flow_match import FlowMatchScheduler
 from diffsynth.diffusion.loss import DirectDistillLoss
+from diffsynth.models.wan_video_bsa import BSAContext, WanBSAConfig
 
 
 class RecordingWanScheduler(FlowMatchScheduler):
@@ -50,10 +51,12 @@ class DummyPipe:
         self.legacy_step_calls = 0
         self.model_inputs = []
         self.model_timesteps = []
+        self.model_contexts = []
 
     def model_fn(self, dit, latents, timestep, progress_id, **kwargs):
         self.model_inputs.append(latents)
         self.model_timesteps.append(timestep.detach().clone())
+        self.model_contexts.append(kwargs.get("bsa_context"))
         return dit * latents + self.output_bias
 
     def step(self, scheduler, progress_id, noise_pred, latents, **kwargs):
@@ -234,3 +237,34 @@ def test_fractional_step_count_is_rejected_without_truncation():
             cfg_scale=1,
         )
     assert pipe.model_inputs == []
+
+
+def test_optional_dense_anchor_reuses_sparse_prediction_and_adds_one_dense_forward():
+    pipe = DummyPipe(weight=0.25, raise_on_pipe_step=True)
+    start = torch.tensor([[[[[1.0]], [[-0.5]], [[2.0]]]]])
+    context = BSAContext.from_config(
+        WanBSAConfig(backend="eager_math"),
+        sparsity=0.8,
+        optimizer_step=2,
+    )
+    loss = DirectDistillLoss(
+        pipe,
+        latents=start.clone(),
+        teacher_latents=torch.zeros_like(start),
+        direct_distill_target_latent_key="teacher_latents",
+        num_inference_steps=4,
+        sigma_shift=5,
+        cfg_scale=1,
+        bsa_context=context,
+        bsa_dense_anchor_weight=0.1,
+        bsa_dense_anchor_interval=2,
+    )
+
+    assert torch.isfinite(loss)
+    assert len(pipe.model_inputs) == 5
+    assert pipe.direct_distill_last_stats["model_forward_count"] == 5
+    assert pipe.direct_distill_last_stats["dense_anchor_active"] is True
+    assert pipe.model_contexts[2].sparsity == 0.8
+    assert pipe.model_contexts[3].sparsity == 0.0
+    assert pipe.model_contexts[2].denoise_progress_id == 2
+    assert pipe.model_contexts[3].denoise_progress_id == 2

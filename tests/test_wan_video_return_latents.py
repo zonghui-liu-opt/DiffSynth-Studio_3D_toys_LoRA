@@ -1,8 +1,10 @@
 import torch
+import pytest
 from PIL import Image
 
 from diffsynth.diffusion.base_pipeline import PipelineUnit
 from diffsynth.pipelines.wan_video import WanVideoPipeline, WanVideoUnit_ImageEmbedderFused
+from diffsynth.models.wan_video_bsa import BSAContext, WanBSAConfig
 
 
 class _EmptyScheduler:
@@ -108,3 +110,45 @@ def test_ti2v_fused_image_latent_matches_rollout_dtype_and_device():
     assert output["first_frame_latents"].dtype == latents.dtype
     assert output["first_frame_latents"].device == latents.device
     assert torch.equal(latents[:, :, :1], output["first_frame_latents"])
+
+
+def test_bsa_inference_requires_four_one_five_and_freezes_context_per_progress():
+    class Scheduler:
+        def set_timesteps(self, steps, **kwargs):
+            self.timesteps = torch.arange(steps, dtype=torch.float32)
+
+        def step(self, noise_pred, timestep, sample):
+            return sample
+
+    initial = torch.zeros(1, 1, 2, 1, 1)
+    pipe, _ = _build_pipeline(initial)
+    pipe.scheduler = Scheduler()
+    contexts = []
+
+    def model_fn(latents, bsa_context, timestep, **kwargs):
+        contexts.append(bsa_context)
+        return torch.zeros_like(latents)
+
+    pipe.model_fn = model_fn
+    context = BSAContext.from_config(WanBSAConfig(backend="eager_math"), sparsity=0.8)
+    output = pipe(
+        num_inference_steps=4,
+        cfg_scale=1,
+        sigma_shift=5,
+        bsa_context=context,
+        return_latents=True,
+        progress_bar_cmd=lambda values: values,
+    )
+    assert torch.equal(output, initial + 1)
+    assert [item.denoise_progress_id for item in contexts] == [0, 1, 2, 3]
+    assert all(item is not context for item in contexts)
+
+    with pytest.raises(ValueError, match="4 steps"):
+        pipe(
+            num_inference_steps=4,
+            cfg_scale=5,
+            sigma_shift=5,
+            bsa_context=context,
+            return_latents=True,
+            progress_bar_cmd=lambda values: values,
+        )

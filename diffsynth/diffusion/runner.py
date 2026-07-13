@@ -39,7 +39,7 @@ def aggregate_training_step_statistics(rank_statistics):
         raise ValueError("At least one rank statistic is required.")
     numeric_keys = (
         "loss_sum", "loss_weight", "video_tokens", "model_tokens", "videos",
-        "step_time_sec", "max_memory_gb",
+        "step_time_sec", "max_memory_gb", "max_memory_reserved_gb", "device_free_memory_gb",
     )
     for rank_id, item in enumerate(rank_statistics):
         for key in numeric_keys:
@@ -53,6 +53,14 @@ def aggregate_training_step_statistics(rank_statistics):
     videos = sum(float(item["videos"]) for item in rank_statistics)
     step_time = max(float(item["step_time_sec"]) for item in rank_statistics)
     max_memory_gb = max(float(item.get("max_memory_gb", 0.0)) for item in rank_statistics)
+    max_memory_reserved_gb = max(
+        float(item.get("max_memory_reserved_gb", 0.0)) for item in rank_statistics
+    )
+    free_values = [
+        float(item.get("device_free_memory_gb", 0.0)) for item in rank_statistics
+        if float(item.get("device_free_memory_gb", 0.0)) > 0
+    ]
+    device_free_memory_gb = min(free_values) if free_values else 0.0
     if loss_weight <= 0 or step_time <= 0:
         raise ValueError("Loss weight and optimizer-step time must be positive.")
     return {
@@ -62,6 +70,8 @@ def aggregate_training_step_statistics(rank_statistics):
         "videos": videos,
         "step_time_sec": step_time,
         "max_memory_gb": max_memory_gb,
+        "max_memory_reserved_gb": max_memory_reserved_gb,
+        "device_free_memory_gb": device_free_memory_gb,
         "global_video_tokens_per_sec": video_tokens / step_time,
         "global_model_tokens_per_sec": model_tokens / step_time,
         "global_videos_per_sec": videos / step_time,
@@ -92,13 +102,15 @@ def _empty_training_step_statistics():
         "videos": 0.0,
         "step_time_sec": 0.0,
         "max_memory_gb": 0.0,
+        "max_memory_reserved_gb": 0.0,
+        "device_free_memory_gb": 0.0,
     }
 
 
 def _gather_training_step_statistics(accelerator, local_statistics):
     keys = (
         "loss_sum", "loss_weight", "video_tokens", "model_tokens", "videos",
-        "step_time_sec", "max_memory_gb",
+        "step_time_sec", "max_memory_gb", "max_memory_reserved_gb", "device_free_memory_gb",
     )
     packed = torch.tensor(
         [local_statistics[key] for key in keys],
@@ -117,6 +129,28 @@ def get_optimizer_class(customized_optimizer=None):
         module = importlib.import_module(module_name)
         print(f"Customized opimizer `{customized_optimizer}` imported.")
         return getattr(module, class_name)
+
+
+def build_optimizer_param_groups(model, learning_rate, weight_decay, args=None):
+    factory = getattr(model, "optimizer_param_groups", None)
+    if callable(factory):
+        groups = factory(learning_rate, weight_decay, args=args)
+        if groups is not None:
+            parameter_ids = [id(parameter) for group in groups for parameter in group["params"]]
+            trainable_ids = [id(parameter) for parameter in model.parameters() if parameter.requires_grad]
+            if len(parameter_ids) != len(set(parameter_ids)) or set(parameter_ids) != set(trainable_ids):
+                raise RuntimeError(
+                    "Optimizer param groups must cover every trainable parameter exactly once."
+                )
+            return groups
+    return model.trainable_modules()
+
+
+def advance_completed_optimizer_steps(completed_steps, *, sync_gradients, step_was_skipped):
+    completed_steps = int(completed_steps)
+    if completed_steps < 0:
+        raise ValueError("completed_steps must be non-negative.")
+    return completed_steps + int(bool(sync_gradients) and not bool(step_was_skipped))
 
 
 def save_training_args(args):
@@ -176,10 +210,13 @@ def launch_training_task(
             "the offloaded model is not DDP/FSDP-wrapped, so gradients would not synchronize."
         )
 
-    optimizer_class = get_optimizer_class(customized_optimizer)
-    optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    optimizer_class = get_optimizer_class(customized_optimizer)
+    optimizer_parameters = build_optimizer_param_groups(
+        model, learning_rate, weight_decay, args=args
+    )
+    optimizer = optimizer_class(optimizer_parameters, lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
 
     if enable_model_cpu_offload:
         optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
@@ -190,8 +227,40 @@ def launch_training_task(
         model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
+    unwrapped_model = accelerator.unwrap_model(model)
+    if getattr(unwrapped_model, "enable_bsa", False):
+        estimated_optimizer_steps = math.ceil(
+            len(dataloader) * num_epochs / accelerator.gradient_accumulation_steps
+        )
+        resume_manifest = getattr(unwrapped_model, "bsa_resume_manifest", None)
+        schedule_steps = (
+            int(resume_manifest["max_optimizer_steps"])
+            if isinstance(resume_manifest, dict) and resume_manifest.get("max_optimizer_steps")
+            else estimated_optimizer_steps
+        )
+        unwrapped_model.set_bsa_training_progress(
+            unwrapped_model.bsa_completed_optimizer_steps, schedule_steps
+        )
+        if schedule_steps < 1500 and accelerator.is_main_process:
+            print(
+                f"Warning: BSA schedule has only {schedule_steps} optimizer steps; "
+                "the first formal experiment should use at least 3000."
+            )
+    if getattr(unwrapped_model, "enable_bsa", False):
+        unwrapped_model.probe_bsa_backend(accelerator.device)
+    if accelerator.is_main_process and getattr(unwrapped_model, "enable_bsa", False):
+        unwrapped_model.write_bsa_student_info(include_runtime=False)
+        info = unwrapped_model._wan_bsa_student_info
+        print(
+            "Wan BSA injected: "
+            f"{info['injected_bsa_modules']}/{info['expected_self_attention_modules']} self-attention layers, "
+            f"cross={info['cross_attention_bsa_modules']}, block={tuple(info['block_size'])}, "
+            f"gate={info['gate_type']}/{info['gate_granularity']}, backend={info['backend']}."
+        )
+    bsa_runtime_info_written = False
+    bsa_optimizer_info_written = False
     accumulated_statistics = _empty_training_step_statistics()
-    loss_ema = None
+    loss_ema = getattr(unwrapped_model, "bsa_loss_ema", None)
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
             if enable_training_metrics:
@@ -206,16 +275,74 @@ def launch_training_task(
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)
+                if (
+                    accelerator.is_main_process
+                    and getattr(unwrapped_model, "enable_bsa", False)
+                    and not bsa_runtime_info_written
+                ):
+                    unwrapped_model.write_bsa_student_info(include_runtime=True)
+                    bsa_runtime_info_written = True
                 accelerator.backward(loss)
+                total_grad_norm = None
+                max_grad_norm = float(getattr(args, "max_grad_norm", 0.0)) if args is not None else 0.0
+                if accelerator.sync_gradients and max_grad_norm > 0:
+                    total_grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    if not bool(torch.isfinite(torch.as_tensor(total_grad_norm)).all()):
+                        raise RuntimeError("Non-finite gradient norm detected; stopping before optimizer.step().")
                 if enable_model_cpu_offload:
                     offload_manager.after_backward()
                 optimizer.step()
+                optimizer_step_was_skipped = bool(
+                    getattr(accelerator, "optimizer_step_was_skipped", False)
+                )
                 scheduler.step()
-                optimizer.zero_grad()
+                unwrapped_model = accelerator.unwrap_model(model)
+                bsa_metrics = {}
+                if accelerator.sync_gradients and not optimizer_step_was_skipped:
+                    bsa_metrics_fn = getattr(unwrapped_model, "bsa_step_metrics", None)
+                    if callable(bsa_metrics_fn):
+                        bsa_metrics = bsa_metrics_fn(total_grad_norm)
+                    if getattr(unwrapped_model, "enable_bsa", False):
+                        unwrapped_model.set_bsa_training_progress(
+                            advance_completed_optimizer_steps(
+                                unwrapped_model.bsa_completed_optimizer_steps,
+                                sync_gradients=accelerator.sync_gradients,
+                                step_was_skipped=optimizer_step_was_skipped,
+                            ),
+                            unwrapped_model.bsa_max_optimizer_steps,
+                        )
+                    if (
+                        accelerator.is_main_process
+                        and getattr(unwrapped_model, "enable_bsa", False)
+                        and not bsa_optimizer_info_written
+                    ):
+                        optimizer_groups = []
+                        for group in optimizer.param_groups:
+                            optimizer_groups.append({
+                                "name": group.get("name", "unnamed"),
+                                "parameter_count": sum(
+                                    parameter.numel() for parameter in group["params"]
+                                ),
+                                "lr": float(group["lr"]),
+                                "weight_decay": float(group.get("weight_decay", 0.0)),
+                                "parameter_dtypes": sorted({
+                                    str(parameter.dtype) for parameter in group["params"]
+                                }),
+                            })
+                        state_dtypes = sorted({
+                            str(value.dtype)
+                            for state in optimizer.state.values()
+                            for value in state.values()
+                            if isinstance(value, torch.Tensor)
+                        })
+                        unwrapped_model._wan_bsa_student_info["optimizer_groups"] = optimizer_groups
+                        unwrapped_model._wan_bsa_student_info["optimizer_state_dtypes"] = state_dtypes
+                        unwrapped_model.write_bsa_student_info(include_runtime=True)
+                        bsa_optimizer_info_written = True
+                optimizer.zero_grad(set_to_none=True)
                 if enable_training_metrics:
                     _synchronize_training_device(accelerator)
                     accumulated_statistics["step_time_sec"] += time.perf_counter() - compute_started_at
-                    unwrapped_model = accelerator.unwrap_model(model)
                     context = getattr(unwrapped_model, "_last_training_step_context", None)
                     if not isinstance(context, dict):
                         raise RuntimeError(
@@ -235,19 +362,65 @@ def launch_training_task(
                             accumulated_statistics["max_memory_gb"],
                             torch.cuda.max_memory_allocated(accelerator.device) / (1024 ** 3),
                         )
+                        accumulated_statistics["max_memory_reserved_gb"] = max(
+                            accumulated_statistics["max_memory_reserved_gb"],
+                            torch.cuda.max_memory_reserved(accelerator.device) / (1024 ** 3),
+                        )
+                        free_bytes, _ = torch.cuda.mem_get_info(accelerator.device)
+                        free_gb = free_bytes / (1024 ** 3)
+                        previous_free = accumulated_statistics["device_free_memory_gb"]
+                        accumulated_statistics["device_free_memory_gb"] = (
+                            free_gb if previous_free == 0 else min(previous_free, free_gb)
+                        )
 
                     if accelerator.sync_gradients:
-                        optimizer_step_was_skipped = bool(
-                            getattr(accelerator, "optimizer_step_was_skipped", False)
-                        )
                         if not optimizer_step_was_skipped:
                             rank_statistics = _gather_training_step_statistics(
                                 accelerator, accumulated_statistics
                             )
                             global_statistics = aggregate_training_step_statistics(rank_statistics)
+                            bsa_memory_target_met = None
+                            if getattr(unwrapped_model, "enable_bsa", False):
+                                hard_stop = float(getattr(args, "bsa_memory_hard_stop_gib", 75.0))
+                                hard_min_free = float(
+                                    getattr(args, "bsa_memory_hard_min_free_gib", 4.0)
+                                )
+                                target_allocated = float(
+                                    getattr(args, "bsa_memory_target_allocated_gib", 70.0)
+                                )
+                                target_reserved = float(
+                                    getattr(args, "bsa_memory_target_reserved_gib", 73.0)
+                                )
+                                target_min_free = float(
+                                    getattr(args, "bsa_min_device_free_gib", 6.0)
+                                )
+                                bsa_memory_target_met = (
+                                    global_statistics["max_memory_gb"] <= target_allocated
+                                    and global_statistics["max_memory_reserved_gb"] <= target_reserved
+                                    and (
+                                        global_statistics["device_free_memory_gb"] == 0
+                                        or global_statistics["device_free_memory_gb"] >= target_min_free
+                                    )
+                                )
+                                if (
+                                    global_statistics["max_memory_gb"] >= hard_stop
+                                    or global_statistics["max_memory_reserved_gb"] >= hard_stop
+                                    or (
+                                        global_statistics["device_free_memory_gb"] > 0
+                                        and global_statistics["device_free_memory_gb"] < hard_min_free
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "BSA memory hard stop triggered: "
+                                        f"allocated={global_statistics['max_memory_gb']:.2f} GiB, "
+                                        f"reserved={global_statistics['max_memory_reserved_gb']:.2f} GiB, "
+                                        f"free={global_statistics['device_free_memory_gb']:.2f} GiB."
+                                    )
                             loss_ema = update_loss_ema(
                                 loss_ema, global_statistics["loss"], beta=loss_ema_beta
                             )
+                            if getattr(unwrapped_model, "enable_bsa", False):
+                                unwrapped_model.bsa_loss_ema = loss_ema
                             model_tokens_per_sec = global_statistics["global_model_tokens_per_sec"]
                             videos_per_sec = global_statistics["global_videos_per_sec"]
                             metrics = {
@@ -263,6 +436,16 @@ def launch_training_task(
                             }
                             if global_statistics["max_memory_gb"] > 0:
                                 metrics["system/max_memory_gb"] = global_statistics["max_memory_gb"]
+                                metrics["system/max_memory_allocated_gb"] = global_statistics["max_memory_gb"]
+                            if global_statistics["max_memory_reserved_gb"] > 0:
+                                metrics["system/max_memory_reserved_gb"] = global_statistics["max_memory_reserved_gb"]
+                            if global_statistics["device_free_memory_gb"] > 0:
+                                metrics["system/device_free_memory_gb"] = global_statistics["device_free_memory_gb"]
+                            if bsa_memory_target_met is not None:
+                                metrics["system/bsa_memory_target_met"] = float(bsa_memory_target_met)
+                            if bsa_metrics:
+                                metrics["train/loss_total"] = global_statistics["loss"]
+                            metrics.update(bsa_metrics)
                             model_logger.on_step_end(
                                 accelerator, model, save_steps, metrics=metrics
                             )

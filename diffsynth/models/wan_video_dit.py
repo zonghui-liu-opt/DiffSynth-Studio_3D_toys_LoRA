@@ -226,7 +226,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, bsa_context=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -238,7 +238,11 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        if bsa_context is None:
+            self_attn_output = self.self_attn(input_x, freqs)
+        else:
+            self_attn_output = self.self_attn(input_x, freqs, bsa_context=bsa_context)
+        x = self.gate(x, gate_msa, self_attn_output)
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -517,6 +521,7 @@ class WanModel(torch.nn.Module):
                 use_gradient_checkpointing_offload: bool = False,
                 **kwargs,
                 ):
+        bsa_context = kwargs.get("bsa_context")
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
@@ -528,6 +533,8 @@ class WanModel(torch.nn.Module):
             context = torch.cat([clip_embdding, context], dim=1)
         
         x, (f, h, w) = self.patchify(x)
+        if bsa_context is not None and getattr(bsa_context, "enabled", False):
+            bsa_context = bsa_context.with_grid((f, h, w))
         
         freqs = torch.cat([
             self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -541,10 +548,10 @@ class WanModel(torch.nn.Module):
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs, bsa_context
                 )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, bsa_context)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

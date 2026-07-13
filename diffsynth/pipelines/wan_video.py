@@ -1,4 +1,5 @@
 import torch, types
+from dataclasses import replace
 import numpy as np
 from PIL import Image
 from einops import repeat
@@ -267,7 +268,13 @@ class WanVideoPipeline(BasePipeline):
         progress_bar_cmd=tqdm,
         output_type: Literal["quantized", "floatpoint"] = "quantized",
         return_latents: bool = False,
+        bsa_context = None,
     ):
+        if bsa_context is not None and getattr(bsa_context, "enabled", False):
+            if num_inference_steps != 4 or cfg_scale != 1 or sigma_shift != 5:
+                raise ValueError(
+                    "Wan BSA DirectDistill inference requires 4 steps, cfg_scale=1, sigma_shift=5."
+                )
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
         
@@ -303,6 +310,7 @@ class WanVideoPipeline(BasePipeline):
             "wantodance_music_path": wantodance_music_path, "wantodance_reference_image": wantodance_reference_image, "wantodance_fps": wantodance_fps,
             "wantodance_keyframes": wantodance_keyframes, "wantodance_keyframes_mask": wantodance_keyframes_mask,
             "framewise_decoding": framewise_decoding,
+            "bsa_context": bsa_context,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -319,14 +327,20 @@ class WanVideoPipeline(BasePipeline):
                 
             # Timestep
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+            iteration_shared = inputs_shared
+            if bsa_context is not None and getattr(bsa_context, "enabled", False):
+                iteration_shared = dict(inputs_shared)
+                iteration_shared["bsa_context"] = replace(
+                    bsa_context, denoise_progress_id=progress_id
+                )
             
             # Inference
-            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
+            noise_pred_posi = self.model_fn(**models, **iteration_shared, **inputs_posi, timestep=timestep)
             if cfg_scale != 1.0:
                 if cfg_merge:
                     noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
                 else:
-                    noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
+                    noise_pred_nega = self.model_fn(**models, **iteration_shared, **inputs_nega, timestep=timestep)
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
@@ -1317,8 +1331,27 @@ def model_fn_wan_video(
     wantodance_fps: float = 30.0,
     music_feature = None,
     skip_9th_layer: bool = False,
+    bsa_context = None,
     **kwargs,
 ):
+    if bsa_context is not None and getattr(bsa_context, "enabled", False):
+        unsupported = []
+        if use_unified_sequence_parallel:
+            unsupported.append("unified sequence parallel")
+        if reference_latents is not None:
+            unsupported.append("reference_latents")
+        if vace_context is not None:
+            unsupported.append("VACE")
+        if vap is not None:
+            unsupported.append("VAP")
+        if animate_adapter is not None or pose_latents is not None or face_pixel_values is not None:
+            unsupported.append("Animate")
+        if sliding_window_size is not None or sliding_window_stride is not None:
+            unsupported.append("sliding-window inference")
+        if unsupported:
+            raise ValueError(
+                "P0 Wan BSA does not support " + ", ".join(unsupported) + "."
+            )
     if sliding_window_size is not None and sliding_window_stride is not None:
         model_kwargs = dict(
             dit=dit,
@@ -1426,6 +1459,8 @@ def model_fn_wan_video(
     # Patchify
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
+    if bsa_context is not None and getattr(bsa_context, "enabled", False):
+        bsa_context = bsa_context.with_grid((f, h, w))
     
     # Reference image
     if reference_latents is not None:
@@ -1569,7 +1604,7 @@ def model_fn_wan_video(
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs, bsa_context
                 )
               
             

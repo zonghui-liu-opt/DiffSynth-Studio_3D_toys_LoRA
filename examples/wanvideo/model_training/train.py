@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from PIL import Image
 from safetensors import safe_open
 from diffsynth.core import UnifiedDataset, load_state_dict
+from diffsynth.core.attention import build_bsa_metadata, compute_bsa_top_k, probe_bsa_backend
 from diffsynth.core.data.operators import (
     DataProcessingOperator,
     LoadImage,
@@ -12,6 +13,17 @@ from diffsynth.core.data.operators import (
     ToAbsolutePath,
 )
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
+from diffsynth.models.wan_video_bsa import (
+    BSAContext,
+    WanBSAConfig,
+    bsa_config_manifest,
+    bsa_sparsity_for_step,
+    collect_wan_bsa_runtime_info,
+    inject_wan_bsa,
+    load_wan_bsa_adapter,
+    resolve_bsa_checkpoint,
+    write_student_model_info,
+)
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -202,8 +214,32 @@ class WanTrainingModule(DiffusionTrainingModule):
         direct_distill_preserve_first_frame=False,
         direct_distill_exclude_first_frame_loss=False,
         direct_distill_target_latent_key=None,
+        enable_bsa=False,
+        bsa_config=None,
+        direct_distill_warmstart_lora=None,
+        resume_bsa_checkpoint=None,
+        bsa_student_info_path=None,
+        bsa_dense_anchor_weight=0.0,
+        bsa_dense_anchor_interval=1,
+        bsa_expected_runtime_grid=None,
     ):
         super().__init__()
+        self.enable_bsa = bool(enable_bsa)
+        self.bsa_config = bsa_config
+        self.bsa_completed_optimizer_steps = 0
+        self.bsa_max_optimizer_steps = None
+        self.bsa_resume_manifest = None
+        self.bsa_loss_ema = None
+        self.bsa_student_info_path = bsa_student_info_path
+        self.bsa_expected_runtime_grid = (
+            None if bsa_expected_runtime_grid is None
+            else tuple(int(value) for value in bsa_expected_runtime_grid)
+        )
+        self._bsa_runtime_validated = False
+        self.bsa_dense_anchor_weight = float(bsa_dense_anchor_weight)
+        self.bsa_dense_anchor_interval = int(bsa_dense_anchor_interval)
+        if self.bsa_dense_anchor_weight < 0 or self.bsa_dense_anchor_interval <= 0:
+            raise ValueError("BSA dense anchor weight must be non-negative and interval positive.")
         self.direct_distill_preserve_first_frame = direct_distill_preserve_first_frame
         self.direct_distill_exclude_first_frame_loss = direct_distill_exclude_first_frame_loss
         self.direct_distill_strict = bool(
@@ -215,6 +251,29 @@ class WanTrainingModule(DiffusionTrainingModule):
             direct_distill_target_latent_key or "input_latents"
             if self.direct_distill_strict else None
         )
+        if self.enable_bsa and not self.direct_distill_strict:
+            raise ValueError("Wan BSA training is only supported by strict DirectDistill.")
+        if self.enable_bsa:
+            if not isinstance(self.bsa_config, WanBSAConfig):
+                raise TypeError("enable_bsa requires a validated WanBSAConfig.")
+            if lora_checkpoint is not None and direct_distill_warmstart_lora is not None:
+                raise ValueError("Use only direct_distill_warmstart_lora for BSA warm-start, not lora_checkpoint.")
+            if direct_distill_warmstart_lora is not None and resume_bsa_checkpoint is not None:
+                raise ValueError("BSA warm-start and resume checkpoint are mutually exclusive.")
+            if resume_bsa_checkpoint is not None:
+                resolved_resume = resolve_bsa_checkpoint(resume_bsa_checkpoint, self.bsa_config)
+                lora_checkpoint = resolved_resume["direct_distill_lora"]
+                self.bsa_resume_manifest = resolved_resume["manifest"]
+                self.bsa_completed_optimizer_steps = int(
+                    self.bsa_resume_manifest.get("completed_optimizer_steps", 0)
+                )
+                self.bsa_loss_ema = self.bsa_resume_manifest.get("loss_ema")
+            elif direct_distill_warmstart_lora is not None:
+                lora_checkpoint = direct_distill_warmstart_lora
+            else:
+                raise ValueError(
+                    "Wan BSA requires a dense DirectDistill warm-start or a composite BSA checkpoint."
+                )
         if self.direct_distill_strict:
             self.validate_direct_distill_training_config(
                 task=task,
@@ -270,6 +329,21 @@ class WanTrainingModule(DiffusionTrainingModule):
                 self.assert_direct_distill_checkpoint_coverage(
                     lora_base_model, lora_checkpoint
                 )
+        if self.enable_bsa and not task.endswith(":data_process"):
+            summary = inject_wan_bsa(
+                getattr(self.pipe, lora_base_model),
+                self.bsa_config,
+                expected_layers=30,
+                figurine_lora_path=preset_lora_path,
+                direct_distill_warmstart_path=lora_checkpoint,
+            )
+            if resume_bsa_checkpoint is not None:
+                load_wan_bsa_adapter(
+                    getattr(self.pipe, lora_base_model), resolved_resume["bsa_adapter"]
+                )
+            self.configure_bsa_trainable_parameters(lora_base_model)
+            self.assert_direct_distill_trainable_parameters(lora_base_model, allow_bsa_gate=True)
+            self._wan_bsa_student_info = self.add_bsa_parameter_summary(summary)
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -287,6 +361,214 @@ class WanTrainingModule(DiffusionTrainingModule):
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
+
+    def configure_bsa_trainable_parameters(self, lora_base_model):
+        target = getattr(self.pipe, lora_base_model)
+        for name, parameter in target.named_parameters():
+            trainable = (
+                name.endswith((".lora_A.default.weight", ".lora_B.default.weight"))
+                or name.endswith((".bsa_gate_down.weight", ".bsa_gate_up.weight"))
+            )
+            parameter.requires_grad_(trainable)
+            if trainable and parameter.dtype != torch.float32:
+                parameter.data = parameter.data.float()
+
+    def add_bsa_parameter_summary(self, summary):
+        named = list(self.named_parameters())
+        trainable = [(name, parameter) for name, parameter in named if parameter.requires_grad]
+        lora = [(name, parameter) for name, parameter in trainable if ".lora_" in name]
+        gate = [(name, parameter) for name, parameter in trainable if ".bsa_gate_" in name]
+        summary = dict(summary)
+        summary.update({
+            "total_parameters": sum(parameter.numel() for _, parameter in named),
+            "frozen_parameters": sum(parameter.numel() for _, parameter in named if not parameter.requires_grad),
+            "trainable_parameters": sum(parameter.numel() for _, parameter in trainable),
+            "direct_distill_lora_parameters": sum(parameter.numel() for _, parameter in lora),
+            "bsa_gate_parameters": sum(parameter.numel() for _, parameter in gate),
+            "trainable_parameter_dtypes": sorted({str(parameter.dtype) for _, parameter in trainable}),
+            "trainable_parameter_names": [name for name, _ in trainable],
+        })
+        return summary
+
+    def set_bsa_training_progress(self, completed_optimizer_steps, max_optimizer_steps):
+        if not self.enable_bsa:
+            return
+        self.bsa_completed_optimizer_steps = int(completed_optimizer_steps)
+        self.bsa_max_optimizer_steps = int(max_optimizer_steps)
+        if self.bsa_completed_optimizer_steps < 0 or self.bsa_max_optimizer_steps <= 0:
+            raise ValueError("Invalid BSA optimizer-step progress.")
+
+    def current_bsa_context(self):
+        if not self.enable_bsa:
+            return None
+        if self.bsa_max_optimizer_steps is None:
+            raise RuntimeError("Runner must initialize BSA optimizer-step schedule before forward.")
+        sparsity = bsa_sparsity_for_step(
+            self.bsa_completed_optimizer_steps, self.bsa_max_optimizer_steps
+        )
+        return BSAContext.from_config(
+            self.bsa_config,
+            sparsity=sparsity,
+            optimizer_step=self.bsa_completed_optimizer_steps,
+        )
+
+    def optimizer_param_groups(self, learning_rate, weight_decay, args=None):
+        if not self.enable_bsa:
+            return None
+        lora = []
+        gate = []
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if ".bsa_gate_" in name:
+                gate.append(parameter)
+            elif ".lora_" in name:
+                lora.append(parameter)
+            else:
+                raise RuntimeError(f"Unexpected BSA trainable parameter: {name}")
+        if not lora or not gate or set(map(id, lora)).intersection(map(id, gate)):
+            raise RuntimeError("BSA optimizer groups must contain disjoint non-empty LoRA and gate sets.")
+        gate_lr = float(getattr(args, "bsa_gate_learning_rate", 2e-5))
+        return [
+            {"name": "direct_distill_lora", "params": lora, "lr": float(learning_rate), "weight_decay": 0.0},
+            {"name": "bsa_gate", "params": gate, "lr": gate_lr, "weight_decay": 0.0},
+        ]
+
+    def bsa_checkpoint_manifest(self):
+        if not self.enable_bsa:
+            return None
+        current_sparsity = bsa_sparsity_for_step(
+            self.bsa_completed_optimizer_steps,
+            self.bsa_max_optimizer_steps or max(self.bsa_completed_optimizer_steps, 1),
+        )
+        current_top_k = None
+        try:
+            current_top_k = collect_wan_bsa_runtime_info(self.pipe.dit)["top_k"]
+        except RuntimeError:
+            pass
+        return bsa_config_manifest(
+            self.bsa_config,
+            completed_optimizer_steps=self.bsa_completed_optimizer_steps,
+            max_optimizer_steps=self.bsa_max_optimizer_steps,
+            current_requested_sparsity=current_sparsity,
+            current_top_k=current_top_k,
+            loss_ema=self.bsa_loss_ema,
+            figurine_lora_sha256=self._wan_bsa_student_info.get("figurine_lora_sha256"),
+            direct_distill_warmstart_sha256=self._wan_bsa_student_info.get(
+                "dense_direct_distill_warmstart_sha256"
+            ),
+        )
+
+    @staticmethod
+    def _parameter_group_norm(parameters, gradient=False):
+        values = []
+        for parameter in parameters:
+            value = parameter.grad if gradient else parameter
+            if value is None:
+                continue
+            values.append(torch.linalg.vector_norm(value.detach()))
+        if not values:
+            return torch.tensor(0.0), torch.tensor(0)
+        values = torch.stack(values)
+        return (
+            torch.linalg.vector_norm(torch.nan_to_num(values)),
+            (~torch.isfinite(values)).sum(),
+        )
+
+    def bsa_step_metrics(self, total_grad_norm=None):
+        if not self.enable_bsa:
+            return {}
+        runtime = collect_wan_bsa_runtime_info(self.pipe.dit)
+        lora = []
+        gate = []
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            (gate if ".bsa_gate_" in name else lora).append(parameter)
+        gate_norm, _ = self._parameter_group_norm(gate)
+        lora_grad_norm, lora_nonfinite = self._parameter_group_norm(lora, gradient=True)
+        gate_grad_norm, gate_nonfinite = self._parameter_group_norm(gate, gradient=True)
+        metrics = {
+            "train/bsa_requested_sparsity": bsa_sparsity_for_step(
+                self.bsa_completed_optimizer_steps, self.bsa_max_optimizer_steps
+            ),
+            "train/bsa_actual_sparsity": runtime["actual_sparsity"],
+            "train/bsa_top_k": runtime["top_k"],
+            "train/bsa_num_blocks": runtime["num_blocks"],
+            "train/bsa_padding_ratio": runtime["padding_ratio"],
+            "train/bsa_selected_valid_token_ratio": runtime["selected_valid_token_ratio"],
+            "train/bsa_gate_block_count": runtime["num_blocks"],
+            "train/bsa_gate_input_rms": runtime["gate_input_rms"],
+            "train/bsa_gate_output_rms": runtime["gate_output_rms"],
+            "train/bsa_gate_parameter_norm": gate_norm,
+            "train/direct_distill_lora_grad_norm": lora_grad_norm,
+            "train/bsa_gate_grad_norm": gate_grad_norm,
+            "train/nonfinite_gradient_count": lora_nonfinite + gate_nonfinite,
+        }
+        loss_stats = getattr(self.pipe, "direct_distill_last_stats", {})
+        if loss_stats.get("endpoint_loss") is not None:
+            metrics["train/loss_endpoint"] = loss_stats["endpoint_loss"]
+        if loss_stats.get("dense_anchor_loss") is not None:
+            metrics["train/loss_dense_anchor"] = loss_stats["dense_anchor_loss"]
+        metrics["system/anchor_active_step"] = float(
+            bool(loss_stats.get("dense_anchor_active", False))
+        )
+        if total_grad_norm is not None:
+            metrics["train/total_grad_norm"] = total_grad_norm
+        return metrics
+
+    def write_bsa_student_info(self, include_runtime=False):
+        if not self.enable_bsa or not self.bsa_student_info_path:
+            return
+        runtime = None
+        if include_runtime:
+            runtime = collect_wan_bsa_runtime_info(self.pipe.dit)
+            runtime = {
+                key: (float(value.detach().cpu()) if isinstance(value, torch.Tensor) else value)
+                for key, value in runtime.items()
+            }
+        write_student_model_info(
+            self.bsa_student_info_path, self._wan_bsa_student_info, runtime
+        )
+
+    def validate_bsa_runtime(self):
+        if not getattr(self, "enable_bsa", False) or getattr(self, "_bsa_runtime_validated", False):
+            return
+        runtime = collect_wan_bsa_runtime_info(self.pipe.dit)
+        if (
+            self.bsa_expected_runtime_grid is not None
+            and tuple(runtime["runtime_grid"]) != self.bsa_expected_runtime_grid
+        ):
+            raise RuntimeError(
+                f"BSA runtime grid {runtime['runtime_grid']} does not match expected "
+                f"{self.bsa_expected_runtime_grid}."
+            )
+        metadata = build_bsa_metadata(runtime["runtime_grid"], self.bsa_config.block_size)
+        target_top_k = compute_bsa_top_k(
+            metadata.num_blocks, self.bsa_config.target_sparsity
+        )
+        if tuple(runtime["runtime_grid"]) == (41, 15, 26) and target_top_k != 55:
+            raise RuntimeError(f"Target Wan BSA grid must produce K=55, received {target_top_k}.")
+        self._wan_bsa_student_info["expected_runtime_grid"] = self.bsa_expected_runtime_grid
+        self._wan_bsa_student_info["target_top_k"] = target_top_k
+        self._bsa_runtime_validated = True
+
+    def probe_bsa_backend(self, device):
+        if not self.enable_bsa:
+            return None
+        attention = self.pipe.dit.blocks[0].self_attn
+        dtype = torch.bfloat16 if torch.device(device).type != "cpu" else torch.float32
+        result = probe_bsa_backend(
+            self.bsa_config.backend,
+            device=device,
+            dtype=dtype,
+            num_heads=attention.num_heads,
+            head_dim=attention.head_dim,
+            block_capacity=72,
+            mask_mode=self.bsa_config.mask_mode,
+        )
+        self._wan_bsa_student_info["backend_probe"] = result
+        return result
 
     @staticmethod
     def validate_direct_distill_training_config(
@@ -332,15 +614,17 @@ class WanTrainingModule(DiffusionTrainingModule):
                     "is frozen, while lora_checkpoint is the trainable DirectDistill adapter."
                 )
 
-    def assert_direct_distill_trainable_parameters(self, lora_base_model):
+    def assert_direct_distill_trainable_parameters(self, lora_base_model, allow_bsa_gate=False):
         trainable_names = self.trainable_param_names()
         if not trainable_names:
             raise RuntimeError("Strict DirectDistill found no trainable LoRA parameters.")
         target_prefix = f"pipe.{lora_base_model}."
         lora_suffixes = (".lora_A.default.weight", ".lora_B.default.weight")
+        gate_suffixes = (".bsa_gate_down.weight", ".bsa_gate_up.weight")
+        allowed_suffixes = lora_suffixes + (gate_suffixes if allow_bsa_gate else tuple())
         invalid_names = sorted(
             name for name in trainable_names
-            if not name.startswith(target_prefix) or not name.endswith(lora_suffixes)
+            if not name.startswith(target_prefix) or not name.endswith(allowed_suffixes)
         )
         if invalid_names:
             raise RuntimeError(
@@ -351,6 +635,11 @@ class WanTrainingModule(DiffusionTrainingModule):
             raise RuntimeError("Strict DirectDistill found no trainable PEFT LoRA A parameters.")
         if not any(name.endswith(lora_suffixes[1]) for name in trainable_names):
             raise RuntimeError("Strict DirectDistill found no trainable PEFT LoRA B parameters.")
+        if allow_bsa_gate:
+            if not any(name.endswith(gate_suffixes[0]) for name in trainable_names):
+                raise RuntimeError("Strict BSA DirectDistill found no trainable gate_down parameters.")
+            if not any(name.endswith(gate_suffixes[1]) for name in trainable_names):
+                raise RuntimeError("Strict BSA DirectDistill found no trainable gate_up parameters.")
 
     @staticmethod
     def validate_checkpoint_tensor_coverage(expected_shapes, checkpoint_tensors):
@@ -533,6 +822,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs_shared["direct_distill_target_latent_key"] = self.direct_distill_target_latent_key
         inputs_shared["direct_distill_preserve_first_frame"] = self.direct_distill_preserve_first_frame
         inputs_shared["direct_distill_exclude_first_frame_loss"] = self.direct_distill_exclude_first_frame_loss
+        if getattr(self, "enable_bsa", False):
+            inputs_shared["bsa_context"] = self.current_bsa_context()
+            inputs_shared["bsa_dense_anchor_weight"] = self.bsa_dense_anchor_weight
+            inputs_shared["bsa_dense_anchor_interval"] = self.bsa_dense_anchor_interval
         return inputs_shared
         
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
@@ -638,6 +931,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         }
         inputs = inputs_shared, inputs_posi, inputs_nega
         loss = self.task_to_loss[self.task](self.pipe, *inputs)
+        self.validate_bsa_runtime()
         return loss
 
 
@@ -681,7 +975,60 @@ def wan_parser():
         default=0.98,
         help="Scalar loss EMA beta used by DirectDistill optimizer-step metrics.",
     )
+    parser.add_argument("--enable_bsa", action="store_true", help="Enable portable Wan self-attention BSA.")
+    parser.add_argument("--bsa_block_size", default="4,3,6", help="3D BSA block as T,H,W.")
+    parser.add_argument("--bsa_target_sparsity", type=float, default=0.8)
+    parser.add_argument("--bsa_backend", choices=("sdpa_gather", "eager_math"), default="sdpa_gather")
+    parser.add_argument("--bsa_query_block_chunk", type=int, default=4)
+    parser.add_argument("--bsa_mask_mode", choices=("additive", "bool"), default="additive")
+    parser.add_argument("--bsa_fail_on_backend_fallback", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--bsa_gate_granularity", choices=("block",), default="block")
+    parser.add_argument("--bsa_gate_rank", type=int, default=32)
+    parser.add_argument("--bsa_gate_alpha", type=float, default=32.0)
+    parser.add_argument("--bsa_gate_learning_rate", type=float, default=2e-5)
+    parser.add_argument("--bsa_boundary_mode", choices=("fixed_padded", "compact_ragged"), default="fixed_padded")
+    parser.add_argument("--bsa_ragged_count_bias", action="store_true")
+    parser.add_argument("--bsa_trainable_dtype", choices=("fp32",), default="fp32")
+    parser.add_argument("--bsa_dense_anchor_weight", type=float, default=0.0)
+    parser.add_argument("--bsa_dense_anchor_interval", type=int, default=1)
+    parser.add_argument("--direct_distill_warmstart_lora", default=None)
+    parser.add_argument("--resume_bsa_checkpoint", default=None)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--bsa_memory_target_allocated_gib", type=float, default=70.0)
+    parser.add_argument("--bsa_memory_target_reserved_gib", type=float, default=73.0)
+    parser.add_argument("--bsa_memory_hard_stop_gib", type=float, default=75.0)
+    parser.add_argument("--bsa_min_device_free_gib", type=float, default=6.0)
+    parser.add_argument("--bsa_memory_hard_min_free_gib", type=float, default=4.0)
+    parser.add_argument("--bsa_expected_runtime_grid", default=None, help="Optional expected patch grid T,H,W.")
     return parser
+
+
+def parse_bsa_block_size(value):
+    try:
+        parsed = tuple(int(part.strip()) for part in str(value).replace("x", ",").split(","))
+    except ValueError as error:
+        raise ValueError(f"Invalid BSA block size: {value!r}") from error
+    if len(parsed) != 3:
+        raise ValueError(f"BSA block size must have three integers, received {value!r}.")
+    return parsed
+
+
+def build_wan_bsa_config(args):
+    if not args.enable_bsa:
+        return None
+    return WanBSAConfig(
+        block_size=parse_bsa_block_size(args.bsa_block_size),
+        target_sparsity=args.bsa_target_sparsity,
+        backend=args.bsa_backend,
+        query_block_chunk=args.bsa_query_block_chunk,
+        mask_mode=args.bsa_mask_mode,
+        boundary_mode=args.bsa_boundary_mode,
+        count_bias=args.bsa_ragged_count_bias,
+        gate_granularity=args.bsa_gate_granularity,
+        gate_rank=args.bsa_gate_rank,
+        gate_alpha=args.bsa_gate_alpha,
+        fail_on_backend_fallback=args.bsa_fail_on_backend_fallback,
+    )
 
 
 def build_wan_model_logger(args):
@@ -756,6 +1103,18 @@ if __name__ == "__main__":
         direct_distill_preserve_first_frame=args.direct_distill_preserve_first_frame,
         direct_distill_exclude_first_frame_loss=args.direct_distill_exclude_first_frame_loss,
         direct_distill_target_latent_key=args.direct_distill_target_latent_key,
+        enable_bsa=args.enable_bsa,
+        bsa_config=build_wan_bsa_config(args),
+        direct_distill_warmstart_lora=args.direct_distill_warmstart_lora,
+        resume_bsa_checkpoint=args.resume_bsa_checkpoint,
+        bsa_student_info_path=os.path.join(args.output_path, "student_model_info.json")
+        if args.enable_bsa else None,
+        bsa_dense_anchor_weight=args.bsa_dense_anchor_weight,
+        bsa_dense_anchor_interval=args.bsa_dense_anchor_interval,
+        bsa_expected_runtime_grid=(
+            parse_bsa_block_size(args.bsa_expected_runtime_grid)
+            if args.bsa_expected_runtime_grid else None
+        ),
     )
     model_logger = build_wan_model_logger(args)
     launcher_map = {
