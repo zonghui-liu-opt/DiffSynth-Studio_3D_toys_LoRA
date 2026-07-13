@@ -15,6 +15,23 @@ def _env():
     return environment
 
 
+def run_sourced_shell(body: str) -> subprocess.CompletedProcess[str]:
+    command = f'''
+shell_path="$1"
+set -- help
+source "$shell_path" >/dev/null
+{body}
+'''
+    return subprocess.run(
+        ["bash", "-c", command, "_", str(SHELL)],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_env(),
+    )
+
+
 def test_bsa_shell_syntax_help_and_required_commands():
     subprocess.run(["bash", "-n", str(SHELL)], check=True)
     completed = subprocess.run(
@@ -52,5 +69,23 @@ def test_bsa_shell_keeps_frozen_block_gate_and_student_controls():
         "--direct_distill_exclude_first_frame_loss",
         "--direct_distill_warmstart_lora",
         "--resume_bsa_checkpoint",
+        "SEED=1",
+        'NUM_EPOCHS="${NUM_EPOCHS:-24}"',
+        'require_seed_one_metadata "${metadata}"',
     ):
         assert text in source
+
+
+def test_bsa_seed_one_metadata_guard(tmp_path):
+    accepted = tmp_path / "accepted.csv"
+    accepted.write_text("seed,prompt\n1,a\n1,b\n", encoding="utf-8")
+    rejected = tmp_path / "rejected.csv"
+    rejected.write_text("seed,prompt\n1,a\n3,b\n", encoding="utf-8")
+
+    good = run_sourced_shell(f'require_seed_one_metadata "{accepted}"')
+    bad = run_sourced_shell(f'require_seed_one_metadata "{rejected}"')
+
+    assert good.returncode == 0
+    assert "seed=1 metadata检查通过: 2条" in good.stdout
+    assert bad.returncode != 0
+    assert "只允许seed=1" in bad.stderr

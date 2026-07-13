@@ -21,7 +21,8 @@ TEST_OUTPUT="${TEST_OUTPUT:-${REPO_ROOT}/outputs/direct_distill_test}"
 HEIGHT="${HEIGHT:-480}"
 WIDTH="${WIDTH:-832}"
 NUM_FRAMES="${NUM_FRAMES:-81}"
-SEED="${SEED:-1}"
+# 与训练 teacher metadata 保持一致；本项目不开放其他推理 seed。
+SEED=1
 RAND_DEVICE="${RAND_DEVICE:-cpu}"
 NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-overexposed, flicker, incomplete rotation, deformation, identity drift}"
 TEACHER_STEPS="${TEACHER_STEPS:-50}"
@@ -93,6 +94,9 @@ for index, row in enumerate(rows):
         raise SystemExit(f"metadata 第 {index + 2} 行首帧不存在: {image}")
     if not prompt:
         raise SystemExit(f"metadata 第 {index + 2} 行 prompt 为空")
+    raw_seed = (row.get("seed") or "1").strip()
+    if raw_seed != "1":
+        raise SystemExit(f"metadata 第 {index + 2} 行只允许 seed=1，收到: {raw_seed}")
 
 print(len(rows))
 PY

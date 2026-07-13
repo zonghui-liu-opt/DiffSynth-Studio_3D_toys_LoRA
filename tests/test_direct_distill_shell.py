@@ -15,7 +15,7 @@ SHELL = (
 TEST_SHELL = SHELL.with_name("Wan2.2-TI2V-5B-Figurine360-Test.sh")
 
 
-def run_sourced_shell(body: str) -> subprocess.CompletedProcess[str]:
+def run_sourced_shell(body: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
     command = f"""
 shell_path="$1"
 set -- help
@@ -25,7 +25,7 @@ source "$shell_path" >/dev/null
     return subprocess.run(
         ["bash", "-c", command, "_", str(SHELL)],
         cwd=ROOT,
-        check=True,
+        check=check,
         capture_output=True,
         text=True,
     )
@@ -64,6 +64,32 @@ prepare_teacher /tmp/direct-distill-smoke 256 448 17 4 1 0 1 ""
     assert "--validation_seed" not in arguments
 
 
+def test_prepare_formal_uses_only_seed_one():
+    result = run_sourced_shell(
+        """
+doctor_source(){ :; }
+python3(){ printf '%s\\n' "$@"; }
+prepare_teacher /tmp/direct-distill-formal 832 480 81 "" 0 0.1 1 ""
+"""
+    )
+
+    arguments = result.stdout.splitlines()
+    assert arguments.count("--seed") == 1
+    assert arguments[arguments.index("--seed") + 1] == "1"
+    assert "--validation_seed" not in arguments
+
+
+def test_seed_one_metadata_guard_rejects_other_seeds(tmp_path):
+    metadata = tmp_path / "metadata.csv"
+    metadata.write_text("seed,prompt\n1,ok\n2,bad\n", encoding="utf-8")
+    result = run_sourced_shell(
+        f'require_seed_one_metadata "{metadata}"', check=False
+    )
+
+    assert result.returncode != 0
+    assert "只允许 seed=1" in result.stderr
+
+
 def test_shell_has_separate_smoke_and_formal_validation_checkpoints():
     script = SHELL.read_text(encoding="utf-8")
 
@@ -90,6 +116,8 @@ def test_custom_test_shell_help_and_syntax():
     assert "模型只加载一次" in result.stdout
 
     script = TEST_SHELL.read_text(encoding="utf-8")
+    assert "SEED=1" in script
+    assert 'SEED="${SEED:-1}"' not in script
     assert '--batch_start "${START_INDEX}"' in script
     assert '--batch_end "${end}"' in script
     assert "每条样本都会重新加载" not in script
@@ -146,3 +174,31 @@ metadata_count
 
     assert result.returncode != 0
     assert "不是绝对路径" in result.stderr
+
+
+def test_custom_test_shell_rejects_non_one_metadata_seed(tmp_path):
+    image = tmp_path / "first.png"
+    image.touch()
+    metadata = tmp_path / "metadata.csv"
+    metadata.write_text(
+        f'input_image,prompt,seed\n"{image}",turntable,2\n',
+        encoding="utf-8",
+    )
+    command = f"""
+shell_path="$1"
+metadata_path="$2"
+set -- help
+source "$shell_path" >/dev/null
+TEST_METADATA="$metadata_path"
+metadata_count
+"""
+    result = subprocess.run(
+        ["bash", "-c", command, "_", str(TEST_SHELL), str(metadata)],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "只允许 seed=1" in result.stderr

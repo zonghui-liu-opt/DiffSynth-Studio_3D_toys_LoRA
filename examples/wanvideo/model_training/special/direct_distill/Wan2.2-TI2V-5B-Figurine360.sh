@@ -25,8 +25,10 @@ ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-}"
 # ============================================================================
 
 # 固定算法/运行参数。正式 student 的 4/1/5 不允许通过环境变量改写。
-TRAIN_SEEDS="${TRAIN_SEEDS:-2 3 4}"
-VALIDATION_SEEDS="${VALIDATION_SEEDS:-1}"
+# 本项目固定只使用 seed=1。validation seed 留空表示 held-out 对象沿用 TRAIN_SEEDS，
+# 从而保持对象级 train/validation 互斥，但不把 seed 作为 held-out 维度。
+TRAIN_SEEDS="${TRAIN_SEEDS:-1}"
+VALIDATION_SEEDS="${VALIDATION_SEEDS:-}"
 SMOKE_SEEDS="${SMOKE_SEEDS:-1}"
 NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-overexposed, flicker, incomplete rotation, deformation, identity drift}"
 FORMAL_HEIGHT="${FORMAL_HEIGHT:-480}"
@@ -78,6 +80,38 @@ require_dir() {
   [[ -d "$1" ]] || die "$2 不存在: $1"
 }
 
+require_seed_one_policy() {
+  local train_seed_values="$1"
+  local validation_seed_values="$2"
+  [[ "${train_seed_values}" =~ ^[[:space:]]*1[[:space:]]*$ ]] \
+    || die "本项目训练固定只允许 TRAIN_SEEDS=1，收到: ${train_seed_values}"
+  [[ "${validation_seed_values}" =~ ^[[:space:]]*$ ]] \
+    || die "本项目验证沿用 seed=1，请将 VALIDATION_SEEDS 留空"
+}
+
+require_seed_one_metadata() {
+  local metadata="$1"
+  python3 - "${metadata}" <<'PY'
+import csv
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("r", encoding="utf-8-sig", newline="") as file:
+    reader = csv.DictReader(file)
+    if "seed" not in (reader.fieldnames or []):
+        raise SystemExit(f"metadata 缺少 seed 列: {path}")
+    rows = list(reader)
+
+if not rows:
+    raise SystemExit(f"metadata 没有数据行: {path}")
+invalid = sorted({(row.get("seed") or "").strip() for row in rows if (row.get("seed") or "").strip() != "1"})
+if invalid:
+    raise SystemExit(f"metadata 只允许 seed=1，发现: {invalid[:8]}")
+print(f"seed=1 metadata 检查通过: {len(rows)} 条")
+PY
+}
+
 doctor_runtime() {
   command -v accelerate >/dev/null 2>&1 || die "未找到 accelerate 可执行文件"
   python3 -c '
@@ -122,6 +156,7 @@ prepare_teacher() {
   local validation_fraction="${7:-${VALIDATION_FRACTION}}"
   local train_seed_values="${8:-${TRAIN_SEEDS}}"
   local validation_seed_values="${9-${VALIDATION_SEEDS}}"
+  require_seed_one_policy "${train_seed_values}" "${validation_seed_values}"
   doctor_source
   local seed_args=()
   for seed in ${train_seed_values}; do seed_args+=(--seed "${seed}"); done
@@ -196,6 +231,7 @@ train_student() {
   fi
   local metadata="${teacher_root}/metadata_direct_distill_train.csv"
   require_file "${metadata}" "训练 metadata"
+  require_seed_one_metadata "${metadata}"
   local launch=()
   while IFS= read -r -d '' item; do launch+=("${item}"); done < <(accelerate_prefix)
   local command=(
@@ -246,6 +282,7 @@ validate_pair() {
   require_file "${direct_distill_lora}" "DirectDistill LoRA checkpoint"
   local metadata="${teacher_root}/${metadata_name}"
   require_file "${metadata}" "验证 metadata"
+  require_seed_one_metadata "${metadata}"
   local tile_flag="--no-tiled"
   [[ "${VAE_TILED}" != "1" ]] || tile_flag="--tiled"
   python3 "${VALIDATE_PY}" \

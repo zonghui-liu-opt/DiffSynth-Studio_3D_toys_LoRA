@@ -32,7 +32,8 @@ DIRECT_DISTILL_LR="${DIRECT_DISTILL_LR:-2e-6}"
 DENSE_ANCHOR_WEIGHT="${DENSE_ANCHOR_WEIGHT:-0.0}"
 DENSE_ANCHOR_INTERVAL="${DENSE_ANCHOR_INTERVAL:-2}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-NUM_EPOCHS="${NUM_EPOCHS:-12}"
+# 4卡、单seed=1、约721条源数据时约产生3.9k-4.3k个真实optimizer steps。
+NUM_EPOCHS="${NUM_EPOCHS:-24}"
 SMOKE_EPOCHS="${SMOKE_EPOCHS:-2}"
 DATASET_REPEAT="${DATASET_REPEAT:-1}"
 SAVE_STEPS="${SAVE_STEPS:-200}"
@@ -44,6 +45,8 @@ SMOKE_WIDTH="${SMOKE_WIDTH:-448}"
 SMOKE_NUM_FRAMES="${SMOKE_NUM_FRAMES:-17}"
 VALIDATION_INDEX="${VALIDATION_INDEX:-0}"
 DEVICE="${DEVICE:-cuda}"
+# BSA训练从teacher metadata读取seed；训练与验证入口会强制检查全部为1。
+SEED=1
 
 DD_DIR="${REPO_ROOT}/examples/wanvideo/model_training/special/direct_distill"
 TRAIN_PY="${REPO_ROOT}/examples/wanvideo/model_training/train.py"
@@ -54,6 +57,29 @@ PLOT_PY="${DD_DIR}/plot_direct_distill_metrics.py"
 die() { echo "错误: $*" >&2; exit 1; }
 require_file() { [[ -f "$1" ]] || die "$2不存在: $1"; }
 require_dir() { [[ -d "$1" ]] || die "$2不存在: $1"; }
+
+require_seed_one_metadata() {
+  local metadata="$1"
+  python3 - "${metadata}" <<'PY'
+import csv
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("r", encoding="utf-8-sig", newline="") as file:
+    reader = csv.DictReader(file)
+    if "seed" not in (reader.fieldnames or []):
+        raise SystemExit(f"metadata缺少seed列: {path}")
+    rows = list(reader)
+
+if not rows:
+    raise SystemExit(f"metadata没有数据行: {path}")
+invalid = sorted({(row.get("seed") or "").strip() for row in rows if (row.get("seed") or "").strip() != "1"})
+if invalid:
+    raise SystemExit(f"BSA训练/验证只允许seed=1，发现: {invalid[:8]}")
+print(f"seed=1 metadata检查通过: {len(rows)}条")
+PY
+}
 
 model_paths_json() {
   python3 -c '
@@ -96,14 +122,16 @@ train_bsa() {
   local teacher_root="$1" output="$2" height="$3" width="$4" frames="$5" epochs="$6"
   local expected_grid="${7:-}"
   doctor
-  require_file "${teacher_root}/metadata_direct_distill_train.csv" "DirectDistill训练metadata"
+  local metadata="${teacher_root}/metadata_direct_distill_train.csv"
+  require_file "${metadata}" "DirectDistill训练metadata"
+  require_seed_one_metadata "${metadata}"
   [[ ! -e "${output}" ]] || die "输出路径已存在，请使用新目录: ${output}"
   local launch=()
   while IFS= read -r -d '' item; do launch+=("${item}"); done < <(accelerate_prefix)
   local command=(
     "${launch[@]}" "${TRAIN_PY}"
     --dataset_base_path "${teacher_root}"
-    --dataset_metadata_path "${teacher_root}/metadata_direct_distill_train.csv"
+    --dataset_metadata_path "${metadata}"
     --data_file_keys input_image,teacher_latent
     --height "${height}" --width "${width}" --num_frames "${frames}"
     --dataset_repeat "${DATASET_REPEAT}"
@@ -140,14 +168,17 @@ validate_bsa() {
   doctor
   [[ -n "${BSA_CHECKPOINT}" ]] || die "验证前设置BSA_CHECKPOINT"
   require_file "${BSA_CHECKPOINT}/checkpoint_complete" "组合checkpoint完成标记"
-  require_file "${TEACHER_ROOT}/metadata_direct_distill_validation.csv" "验证metadata"
+  local metadata="${TEACHER_ROOT}/metadata_direct_distill_validation.csv"
+  require_file "${metadata}" "验证metadata"
+  require_seed_one_metadata "${metadata}"
   local model_args=()
   while IFS= read -r -d '' item; do model_args+=("${item}"); done < <(model_path_args)
   python3 "${VALIDATE_PY}" "${model_args[@]}" \
     --tokenizer_path "${TOKENIZER_PATH}" --figurine360_lora "${FIGURINE360_LORA}" \
     --dense_warmstart_lora "${DENSE_WARMSTART_LORA}" --bsa_checkpoint "${BSA_CHECKPOINT}" \
-    --metadata_path "${TEACHER_ROOT}/metadata_direct_distill_validation.csv" \
+    --metadata_path "${metadata}" \
     --dataset_base_path "${TEACHER_ROOT}" --sample_index "${VALIDATION_INDEX}" \
+    --seed "${SEED}" \
     --device "${DEVICE}" --output_dir "${BSA_VALIDATION_OUTPUT}/sample-${VALIDATION_INDEX}"
 }
 

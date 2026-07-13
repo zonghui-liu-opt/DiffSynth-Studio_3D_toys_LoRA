@@ -52,7 +52,7 @@ bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figu
 - 准备命令的最终 summary 中 `failed=0`；若 `failures.jsonl` 非空，历史上已隔离并恢复的记录会保留，结合记录的 `recovered` 字段判断，不要只按文件是否存在下结论。
 - 重跑同一命令会校验并跳过有效产物，不覆盖它们。
 
-teacher 与 student 使用每条 metadata 的同一 seed。smoke 默认 canonical seed 为 `1`。正式默认 `TRAIN_SEEDS="2 3 4"`，held-out `VALIDATION_SEEDS="1"`：validation 同时满足未见首帧和未见 seed，并保留既有 figurine360 的 canonical seed=1。每个对象只属于一个 split，避免跨对象 seed 扩展造成泄漏。
+teacher 与 student 使用每条 metadata 的同一 seed。本项目的 smoke、正式训练、validation 与独立推理全部固定为 `seed=1`：`TRAIN_SEEDS="1"`，`VALIDATION_SEEDS` 留空，validation 对象会沿用训练 seed。每个对象仍只属于一个 split，因此 validation 保持未见对象/首帧，但不再把 seed 作为 held-out 维度。训练与验证入口会拒绝缺少 seed 列或包含非 1 seed 的旧 metadata。
 
 ## 3. 2～10 个 optimizer step 冒烟训练
 
@@ -73,7 +73,7 @@ bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figu
 
 ## 4. 冒烟 teacher/student 对比
 
-把 `SMOKE_VALIDATION_LORA_CHECKPOINT` 指向冒烟 checkpoint，然后执行（不要设置 `TRAIN_LORA_CHECKPOINT`，否则正式训练会 warm-start smoke seed=1，破坏 held-out seed 验收）：
+把 `SMOKE_VALIDATION_LORA_CHECKPOINT` 指向冒烟 checkpoint，然后执行。正式训练不要把 smoke checkpoint 设为 `TRAIN_LORA_CHECKPOINT`；smoke 的分辨率、样本量和用途都只适合连通性检查，不能作为正式 warm-start：
 
 ```bash
 bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figurine360.sh validate-smoke
@@ -92,7 +92,7 @@ bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figu
 
 teacher 默认 50 步、CFG=5、shift=5；student metadata 固定 4 步、CFG=1、shift=5。teacher 若过曝、旋转不完整或首帧/身份错误，应先删除对应坏 latent 并重新生成，不能依赖 student 修复 teacher 缺陷。
 
-## 6. 未见首帧/未见 seed 验证
+## 6. 未见对象/首帧、固定 seed=1 验证
 
 先把 `FORMAL_VALIDATION_LORA_CHECKPOINT` 指向第 5 节正式训练（或正式续训）的最终 checkpoint；不得指向 smoke checkpoint。再从 metadata 的 validation split 选择至少 12 个对象，逐条运行：
 

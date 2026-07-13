@@ -18,6 +18,8 @@ bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figu
 
 正式设置固定为 block `(4,3,6)`、rank-32 block gate、student 4 steps / CFG 1 / shift 5。首次正式实验建议至少 3000 个真实 optimizer steps；程序低于 1500 steps 会警告。
 
+当前正式默认 `NUM_EPOCHS=24`。在4卡、batch=1/rank、gradient accumulation=1、单seed=1时，721行训练metadata约为4344步；若先按对象划出约10% validation，约为3912步。真实步数以 `ceil(train_metadata_rows/4) × epochs` 为准，不能只看源视频数。
+
 ## 2. 冒烟与正式训练
 
 先确认原 DirectDistill teacher 数据和 dense warm-start 均已通过验收，再运行：
@@ -99,7 +101,7 @@ BSA_CHECKPOINT=/path/to/checkpoint-step-... \
 bash examples/wanvideo/model_training/special/direct_distill/Wan2.2-TI2V-5B-Figurine360-BSA.sh bsa-validate
 ```
 
-输出 teacher、A=dense warm-start、B=joint-trained dense、C=joint-trained 80% sparse 的 MP4、latent 和 `validation.json`。至少检查 12 个未见首帧/seed，最好 50 个以上，重点看身份、脸手配件、360°运动、轮廓、闪烁、尾帧和画面右边缘。
+输出 teacher、A=dense warm-start、B=joint-trained dense、C=joint-trained 80% sparse 的 MP4、latent 和 `validation.json`。训练与验证 metadata 都固定为 seed=1；至少检查 12 个未见对象/首帧，最好 50 个以上，重点看身份、脸手配件、360°运动、轮廓、闪烁、尾帧和画面右边缘。
 
 初始门槛：C 相对 teacher 的 endpoint MSE 不超过 A 的 1.10 倍；B 不出现系统性退化；盲评 C 相对 A 的胜出+持平比例至少 90%。
 
