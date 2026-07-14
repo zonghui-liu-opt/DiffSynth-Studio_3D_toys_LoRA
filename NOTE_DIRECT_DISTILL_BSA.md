@@ -2,6 +2,8 @@
 
 本说明只覆盖 BSA 增量。teacher latent 的准备与校验继续按 `NOTE_DIRECT_DISTILL.md` 执行。当前 Stage A 已完成 CPU 合成验证；真实 5B、H100 性能/质量和 Ascend 均待内网验证。
 
+如果 teacher latent 已按 seed 1/2/3/4 提取，但后续训推只使用 seed1，请先执行 [seed1 teacher-latent 安全迁移说明](NOTE_DIRECT_DISTILL_SEED1_TEACHER_LATENTS.md)，不要直接改写 seed 2/3/4 数据行的 seed 字段。
+
 ## 1. 内网 H100 快速部署、配置与检查
 
 把本仓库同步到内网机器后，在已有 CUDA/PyTorch 环境中使用内网 wheel 源安装；脚本本身不会下载模型：
