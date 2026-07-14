@@ -10,6 +10,7 @@ from diffsynth.diffusion.runner import (
     compute_training_workload,
     compute_video_tokens,
     launch_training_task,
+    optimizer_steps_per_epoch,
     update_loss_ema,
 )
 
@@ -23,6 +24,8 @@ def test_video_token_formula_and_loss_ema():
     }
     assert update_loss_ema(None, 10, beta=0.98) == 10
     assert update_loss_ema(10, 20, beta=0.98) == pytest.approx(10.2)
+    assert optimizer_steps_per_epoch(121, 1) == 121
+    assert optimizer_steps_per_epoch(121, 2) == 61
 
 
 def test_rank_statistics_use_sum_for_counts_and_max_for_time_and_memory():
@@ -88,6 +91,63 @@ class _TinyTrainingModel(torch.nn.Module):
             "num_inference_steps": 4,
         }
         return (self.weight - data["target"]) ** 2
+
+
+class _TinyBSAResumeModel(_TinyTrainingModel):
+    enable_bsa = True
+
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+        self.bsa_completed_optimizer_steps = 3
+        self.bsa_max_optimizer_steps = None
+        self.bsa_loss_ema = None
+        self._wan_bsa_student_info = {
+            "injected_bsa_modules": 1,
+            "expected_self_attention_modules": 1,
+            "cross_attention_bsa_modules": 0,
+            "block_size": [4, 3, 6],
+            "gate_type": "low_rank_dynamic",
+            "gate_granularity": "block",
+            "backend": "eager_math",
+        }
+
+    def initialize_bsa_training_schedule(self, steps_per_epoch, total_epochs):
+        self.bsa_max_optimizer_steps = 4
+
+        class Schedule:
+            total_optimizer_steps = 4
+
+            @staticmethod
+            def to_dict():
+                return {
+                    "schedule_runtime": {
+                        "steps_per_epoch": steps_per_epoch,
+                        "planned_total_epochs": total_epochs,
+                        "planned_total_optimizer_steps": 4,
+                        "transition_steps": [2],
+                        "sparsities": [0.0, 0.8],
+                    }
+                }
+
+        return Schedule()
+
+    def probe_bsa_backend(self, device):
+        return None
+
+    def write_bsa_student_info(self, include_runtime=False):
+        return None
+
+    def bsa_step_metrics(self, total_grad_norm=None):
+        return {}
+
+    def set_bsa_training_progress(self, completed_optimizer_steps, max_optimizer_steps):
+        self.bsa_completed_optimizer_steps = completed_optimizer_steps
+        self.bsa_max_optimizer_steps = max_optimizer_steps
+
+    def forward(self, data, inputs=None):
+        self.forward_calls += 1
+        return super().forward(data, inputs=inputs)
 
 
 class _CollectingLogger:
@@ -172,3 +232,36 @@ def test_multi_process_model_cpu_offload_is_rejected_before_training(tmp_path):
             _CollectingLogger(),
             args=args,
         )
+
+
+def test_bsa_weight_continuation_stops_at_saved_plan_total(tmp_path):
+    accelerator = Accelerator(gradient_accumulation_steps=1, cpu=True)
+    logger = _CollectingLogger()
+    model = _TinyBSAResumeModel()
+    args = Namespace(
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        dataset_num_workers=0,
+        save_steps=200,
+        num_epochs=1,
+        enable_model_cpu_offload=False,
+        enable_optimizer_cpu_offload=False,
+        cpu_offload_split_threshold=None,
+        customized_optimizer=None,
+        output_path=str(tmp_path),
+        enable_direct_distill_metrics=False,
+        direct_distill_loss_ema_beta=0.98,
+        max_grad_norm=0.0,
+    )
+
+    launch_training_task(
+        accelerator,
+        _TinyDataset(),
+        model,
+        logger,
+        args=args,
+    )
+
+    assert model.forward_calls == 1
+    assert model.bsa_completed_optimizer_steps == 4
+    assert len(logger.steps) == 1

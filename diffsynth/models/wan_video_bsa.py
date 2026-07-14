@@ -152,8 +152,16 @@ class WanBSASelfAttention(nn.Module):
         self.norm_k = dense_attention.norm_k
         self.attn = dense_attention.attn
         self.bsa_config = config
-        self.bsa_gate_down = nn.Linear(self.dim, config.gate_rank, bias=False)
-        self.bsa_gate_up = nn.Linear(config.gate_rank, self.dim, bias=False)
+        # In inference the dense DiT may already live on CUDA when BSA is injected.
+        # Keep routing math in its trained FP32 precision, but colocate new gates
+        # with the reused projections so the first sparse forward is device-safe.
+        gate_device = self.q.weight.device
+        self.bsa_gate_down = nn.Linear(self.dim, config.gate_rank, bias=False).to(
+            device=gate_device, dtype=torch.float32
+        )
+        self.bsa_gate_up = nn.Linear(config.gate_rank, self.dim, bias=False).to(
+            device=gate_device, dtype=torch.float32
+        )
         nn.init.normal_(self.bsa_gate_down.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.bsa_gate_up.weight)
         self.bsa_engine = BlockSparseAttention(
@@ -227,6 +235,36 @@ def _sha256_file(path: Optional[str]) -> Optional[str]:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_wan_bsa_provenance(
+    manifest: Dict,
+    *,
+    figurine_lora_path: Optional[str] = None,
+    direct_distill_warmstart_path: Optional[str] = None,
+) -> Dict[str, str]:
+    """Fail fast when inference/resume inputs differ from checkpoint provenance."""
+    requested = {
+        "figurine_lora_sha256": figurine_lora_path,
+        "direct_distill_warmstart_sha256": direct_distill_warmstart_path,
+    }
+    requested = {key: path for key, path in requested.items() if path is not None}
+    if not requested:
+        raise ValueError("Wan BSA provenance validation requires at least one input path.")
+    missing = sorted(
+        key for key in requested if not isinstance(manifest.get(key), str)
+    )
+    if missing:
+        raise ValueError(f"BSA manifest is missing required provenance hashes: {missing}")
+    actual = {key: _sha256_file(path) for key, path in requested.items()}
+    mismatches = {
+        key: {"expected": manifest[key], "actual": actual[key]}
+        for key in requested
+        if manifest[key] != actual[key]
+    }
+    if mismatches:
+        raise ValueError(f"BSA checkpoint provenance mismatch: {mismatches}")
+    return actual
 
 
 def inject_wan_bsa(
@@ -324,9 +362,11 @@ def wan_bsa_gate_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     return state
 
 
-def bsa_config_manifest(config: WanBSAConfig, **training_state) -> Dict:
+def bsa_config_manifest(
+    config: WanBSAConfig, *, schema_version: int = 1, **training_state
+) -> Dict:
     manifest = {
-        "schema_version": 1,
+        "schema_version": int(schema_version),
         **asdict(config),
         "block_size": list(config.block_size),
         "block_capacity": math.prod(config.block_size),
@@ -349,8 +389,36 @@ def validate_bsa_manifest(manifest: Dict, config: Optional[WanBSAConfig] = None)
     missing = sorted(required.difference(manifest))
     if missing:
         raise ValueError(f"BSA manifest is missing required fields: {missing}")
-    if manifest["schema_version"] != 1:
+    if manifest["schema_version"] not in (1, 2):
         raise ValueError(f"Unsupported BSA manifest schema: {manifest['schema_version']}")
+    if manifest["schema_version"] == 2:
+        schedule_fields = {
+            "completed_optimizer_steps",
+            "schedule_spec",
+            "schedule_sha256",
+            "schedule_runtime",
+        }
+        missing_schedule = sorted(schedule_fields.difference(manifest))
+        if missing_schedule:
+            raise ValueError(
+                f"BSA schema-v2 manifest is missing schedule fields: {missing_schedule}"
+            )
+        from diffsynth.diffusion.bsa_schedule import compiled_bsa_schedule_from_dict
+
+        compiled = compiled_bsa_schedule_from_dict(
+            manifest, target_sparsity=manifest["target_sparsity"]
+        )
+        completed_steps = manifest["completed_optimizer_steps"]
+        if (
+            isinstance(completed_steps, bool)
+            or int(completed_steps) != completed_steps
+            or not 0 <= int(completed_steps) <= compiled.total_optimizer_steps
+        ):
+            raise ValueError("BSA completed_optimizer_steps is outside the saved schedule.")
+        if manifest.get("max_optimizer_steps") != compiled.total_optimizer_steps:
+            raise ValueError(
+                "BSA max_optimizer_steps does not match the saved schedule runtime."
+            )
     if manifest["gate_type"] != "low_rank_dynamic" or manifest["gate_granularity"] != "block":
         raise ValueError("BSA checkpoint is not a low_rank_dynamic block-gate checkpoint.")
     if math.prod(manifest["block_size"]) != manifest["block_capacity"] or manifest["block_capacity"] != 72:

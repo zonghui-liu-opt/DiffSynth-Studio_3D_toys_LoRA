@@ -176,7 +176,7 @@ def build_parser():
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
-    parser.add_argument("--grid", nargs=3, type=int, default=(41, 15, 26))
+    parser.add_argument("--grid", nargs=3, type=int, default=(21, 15, 26))
     parser.add_argument("--block-size", nargs=3, type=int, default=(4, 3, 6))
     parser.add_argument("--heads", type=int, default=24)
     parser.add_argument("--head-dim", type=int, default=128)

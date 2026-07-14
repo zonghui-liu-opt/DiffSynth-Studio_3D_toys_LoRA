@@ -1,4 +1,5 @@
 import json
+import hashlib
 
 import pytest
 import torch
@@ -8,7 +9,10 @@ from diffsynth.models.wan_video_bsa import (
     bsa_config_manifest,
     resolve_bsa_checkpoint,
     save_composite_bsa_checkpoint,
+    validate_bsa_manifest,
+    validate_wan_bsa_provenance,
 )
+from diffsynth.diffusion.bsa_schedule import compile_bsa_schedule
 from diffsynth.diffusion.runner import (
     advance_completed_optimizer_steps,
     build_optimizer_param_groups,
@@ -62,6 +66,77 @@ def test_incomplete_or_wrong_granularity_checkpoint_fails(tmp_path):
     config_path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="block-gate"):
         resolve_bsa_checkpoint(str(checkpoint), WanBSAConfig())
+
+
+def test_checkpoint_provenance_requires_exact_figurine_and_dense_warmstart(tmp_path):
+    figurine = tmp_path / "figurine.safetensors"
+    dense = tmp_path / "dense.safetensors"
+    figurine.write_bytes(b"figurine")
+    dense.write_bytes(b"dense-19600")
+
+    def sha256(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    manifest = {
+        "figurine_lora_sha256": sha256(figurine),
+        "direct_distill_warmstart_sha256": sha256(dense),
+    }
+    actual = validate_wan_bsa_provenance(
+        manifest,
+        figurine_lora_path=str(figurine),
+        direct_distill_warmstart_path=str(dense),
+    )
+    assert actual == manifest
+
+    dense.write_bytes(b"wrong-dense")
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        validate_wan_bsa_provenance(
+            manifest,
+            figurine_lora_path=str(figurine),
+            direct_distill_warmstart_path=str(dense),
+        )
+
+    with pytest.raises(ValueError, match="missing required provenance"):
+        validate_wan_bsa_provenance(
+            {"figurine_lora_sha256": manifest["figurine_lora_sha256"]},
+            figurine_lora_path=str(figurine),
+            direct_distill_warmstart_path=str(dense),
+        )
+
+
+def test_schema_v2_checkpoint_round_trip_and_schedule_validation(tmp_path):
+    config = WanBSAConfig(backend="eager_math")
+    schedule = compile_bsa_schedule(
+        "conservative_epoch_v1",
+        steps_per_epoch=121,
+        total_epochs=60,
+        target_sparsity=config.target_sparsity,
+    )
+    manifest = bsa_config_manifest(
+        config,
+        schema_version=2,
+        completed_optimizer_steps=200,
+        max_optimizer_steps=schedule.total_optimizer_steps,
+        **schedule.to_dict(),
+    )
+    checkpoint = tmp_path / "checkpoint-step-0000200"
+    save_composite_bsa_checkpoint(_state_dict(), str(checkpoint), manifest)
+
+    loaded = resolve_bsa_checkpoint(str(checkpoint), config)["manifest"]
+    assert loaded["schema_version"] == 2
+    assert loaded["schedule_sha256"] == schedule.spec_sha256
+    assert loaded["schedule_runtime"]["transition_steps"] == list(
+        schedule.transition_steps
+    )
+
+    invalid = dict(manifest, completed_optimizer_steps=schedule.total_optimizer_steps + 1)
+    with pytest.raises(ValueError, match="outside the saved schedule"):
+        validate_bsa_manifest(invalid, config)
+
+    invalid = dict(manifest)
+    invalid.pop("schedule_sha256")
+    with pytest.raises(ValueError, match="missing schedule fields"):
+        validate_bsa_manifest(invalid, config)
 
 
 class _GroupedModel(torch.nn.Module):

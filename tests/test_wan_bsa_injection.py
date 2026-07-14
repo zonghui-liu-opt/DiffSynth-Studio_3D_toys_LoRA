@@ -64,6 +64,21 @@ def test_injection_reuses_dense_modules_and_preserves_state_paths():
         inject_wan_bsa(model, WanBSAConfig(backend="eager_math"), expected_layers=3)
 
 
+def test_new_gates_follow_dense_projection_device_and_keep_fp32_precision():
+    dense = TinyWan(layers=1).to(device="meta", dtype=torch.bfloat16).blocks[0].self_attn
+
+    attention = WanBSASelfAttention.from_dense(
+        dense, WanBSAConfig(backend="eager_math")
+    )
+
+    assert attention.q.weight.device.type == "meta"
+    assert attention.q.weight.dtype == torch.bfloat16
+    assert attention.bsa_gate_down.weight.device == attention.q.weight.device
+    assert attention.bsa_gate_up.weight.device == attention.q.weight.device
+    assert attention.bsa_gate_down.weight.dtype == torch.float32
+    assert attention.bsa_gate_up.weight.dtype == torch.float32
+
+
 def test_zero_gate_dense_context_matches_preinjection_output_exactly():
     torch.manual_seed(21)
     model = TinyWan(layers=1).double()
@@ -134,10 +149,10 @@ def test_student_info_atomic_json_and_schedule(tmp_path):
     model = TinyWan(layers=1)
     summary = inject_wan_bsa(model, WanBSAConfig(backend="eager_math"), expected_layers=1)
     path = tmp_path / "student_model_info.json"
-    write_student_model_info(str(path), summary, {"runtime_grid": [41, 15, 26]})
+    write_student_model_info(str(path), summary, {"runtime_grid": [21, 15, 26]})
     payload = json.loads(path.read_text())
     assert payload["gate_granularity"] == "block"
-    assert payload["runtime"]["runtime_grid"] == [41, 15, 26]
+    assert payload["runtime"]["runtime_grid"] == [21, 15, 26]
     assert not (tmp_path / "student_model_info.json.tmp").exists()
 
     assert bsa_sparsity_for_step(0, 1000) == 0.0

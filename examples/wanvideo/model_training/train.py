@@ -17,14 +17,19 @@ from diffsynth.models.wan_video_bsa import (
     BSAContext,
     WanBSAConfig,
     bsa_config_manifest,
-    bsa_sparsity_for_step,
     collect_wan_bsa_runtime_info,
     inject_wan_bsa,
     load_wan_bsa_adapter,
     resolve_bsa_checkpoint,
+    validate_wan_bsa_provenance,
     write_student_model_info,
 )
 from diffsynth.diffusion import *
+from diffsynth.diffusion.bsa_schedule import (
+    compile_bsa_schedule,
+    compiled_bsa_schedule_from_dict,
+    load_bsa_schedule,
+)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -216,6 +221,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         direct_distill_target_latent_key=None,
         enable_bsa=False,
         bsa_config=None,
+        bsa_sparsity_schedule=None,
         direct_distill_warmstart_lora=None,
         resume_bsa_checkpoint=None,
         bsa_student_info_path=None,
@@ -229,6 +235,18 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.bsa_completed_optimizer_steps = 0
         self.bsa_max_optimizer_steps = None
         self.bsa_resume_manifest = None
+        self.bsa_compiled_schedule = None
+        self.bsa_requested_schedule_spec = (
+            load_bsa_schedule(bsa_sparsity_schedule)
+            if self.enable_bsa and bsa_sparsity_schedule is not None
+            else None
+        )
+        self.bsa_schedule_spec = (
+            self.bsa_requested_schedule_spec
+            if self.bsa_requested_schedule_spec is not None
+            else (load_bsa_schedule("legacy_progress_v1") if self.enable_bsa else None)
+        )
+        self._bsa_resume_compiled_schedule = None
         self.bsa_loss_ema = None
         self.bsa_student_info_path = bsa_student_info_path
         self.bsa_expected_runtime_grid = (
@@ -268,6 +286,14 @@ class WanTrainingModule(DiffusionTrainingModule):
                     self.bsa_resume_manifest.get("completed_optimizer_steps", 0)
                 )
                 self.bsa_loss_ema = self.bsa_resume_manifest.get("loss_ema")
+                if self.bsa_resume_manifest["schema_version"] == 2:
+                    self._bsa_resume_compiled_schedule = compiled_bsa_schedule_from_dict(
+                        self.bsa_resume_manifest,
+                        target_sparsity=self.bsa_config.target_sparsity,
+                    )
+                    self.bsa_schedule_spec = self._bsa_resume_compiled_schedule.spec
+                else:
+                    self.bsa_schedule_spec = load_bsa_schedule("legacy_progress_v1")
             elif direct_distill_warmstart_lora is not None:
                 lora_checkpoint = direct_distill_warmstart_lora
             else:
@@ -283,6 +309,22 @@ class WanTrainingModule(DiffusionTrainingModule):
                 lora_checkpoint=lora_checkpoint,
                 trainable_models=trainable_models,
                 resume_from_checkpoint=resume_from_checkpoint,
+            )
+        if (
+            self.enable_bsa
+            and resume_bsa_checkpoint is not None
+            and self.bsa_resume_manifest["schema_version"] == 2
+        ):
+            if not isinstance(
+                self.bsa_resume_manifest.get("direct_distill_warmstart_sha256"), str
+            ):
+                raise ValueError(
+                    "BSA schema-v2 resume manifest is missing the original "
+                    "DirectDistill warm-start provenance hash."
+                )
+            validate_wan_bsa_provenance(
+                self.bsa_resume_manifest,
+                figurine_lora_path=preset_lora_path,
             )
 
         # Warning
@@ -335,9 +377,14 @@ class WanTrainingModule(DiffusionTrainingModule):
                 self.bsa_config,
                 expected_layers=30,
                 figurine_lora_path=preset_lora_path,
-                direct_distill_warmstart_path=lora_checkpoint,
+                direct_distill_warmstart_path=(
+                    None if resume_bsa_checkpoint is not None else lora_checkpoint
+                ),
             )
             if resume_bsa_checkpoint is not None:
+                summary["dense_direct_distill_warmstart_sha256"] = (
+                    self.bsa_resume_manifest.get("direct_distill_warmstart_sha256")
+                )
                 load_wan_bsa_adapter(
                     getattr(self.pipe, lora_base_model), resolved_resume["bsa_adapter"]
                 )
@@ -390,25 +437,111 @@ class WanTrainingModule(DiffusionTrainingModule):
         })
         return summary
 
+    def initialize_bsa_training_schedule(self, steps_per_epoch, total_epochs):
+        if not self.enable_bsa:
+            raise RuntimeError("Cannot initialize a BSA schedule when BSA is disabled.")
+        steps_per_epoch = int(steps_per_epoch)
+        total_epochs = int(total_epochs)
+        if steps_per_epoch <= 0 or total_epochs <= 0:
+            raise ValueError("BSA steps_per_epoch and total_epochs must be positive.")
+
+        requested_spec = self.bsa_requested_schedule_spec or self.bsa_schedule_spec
+        requested = compile_bsa_schedule(
+            requested_spec,
+            steps_per_epoch=steps_per_epoch,
+            total_epochs=total_epochs,
+            target_sparsity=self.bsa_config.target_sparsity,
+        )
+        resume_manifest = self.bsa_resume_manifest
+        if resume_manifest is None:
+            compiled = requested
+        elif resume_manifest["schema_version"] == 2:
+            saved = self._bsa_resume_compiled_schedule
+            if saved is None:
+                raise RuntimeError("BSA schema-v2 resume schedule was not loaded.")
+            if requested.spec_sha256 != saved.spec_sha256:
+                raise ValueError(
+                    "BSA resume schedule conflicts with the checkpoint. Reuse the checkpoint "
+                    "schedule or start a new experiment from weights."
+                )
+            if (
+                requested.steps_per_epoch != saved.steps_per_epoch
+                or requested.total_epochs != saved.total_epochs
+                or requested.total_optimizer_steps != saved.total_optimizer_steps
+            ):
+                raise ValueError(
+                    "BSA resume training geometry conflicts with the checkpoint: "
+                    f"current=(steps_per_epoch={requested.steps_per_epoch}, "
+                    f"total_epochs={requested.total_epochs}), "
+                    f"checkpoint=(steps_per_epoch={saved.steps_per_epoch}, "
+                    f"total_epochs={saved.total_epochs})."
+                )
+            compiled = saved
+        else:
+            saved_total = resume_manifest.get("max_optimizer_steps")
+            if saved_total is None:
+                raise ValueError(
+                    "Legacy BSA checkpoint is missing max_optimizer_steps and cannot resume training."
+                )
+            legacy = compile_bsa_schedule(
+                "legacy_progress_v1",
+                steps_per_epoch=steps_per_epoch,
+                total_epochs=total_epochs,
+                target_sparsity=self.bsa_config.target_sparsity,
+            )
+            if requested.spec_sha256 != legacy.spec_sha256:
+                raise ValueError(
+                    "Legacy BSA checkpoints require bsa_sparsity_schedule=legacy_progress_v1."
+                )
+            if requested.total_optimizer_steps != int(saved_total):
+                raise ValueError(
+                    "Legacy BSA resume training geometry does not reproduce the checkpoint plan: "
+                    f"current total={requested.total_optimizer_steps}, checkpoint total={saved_total}."
+                )
+            compiled = legacy
+
+        self.bsa_compiled_schedule = compiled
+        self.bsa_schedule_spec = compiled.spec
+        self.set_bsa_training_progress(
+            self.bsa_completed_optimizer_steps, compiled.total_optimizer_steps
+        )
+        if hasattr(self, "_wan_bsa_student_info"):
+            self._wan_bsa_student_info.update(compiled.to_dict())
+        return compiled
+
     def set_bsa_training_progress(self, completed_optimizer_steps, max_optimizer_steps):
         if not self.enable_bsa:
             return
         self.bsa_completed_optimizer_steps = int(completed_optimizer_steps)
         self.bsa_max_optimizer_steps = int(max_optimizer_steps)
-        if self.bsa_completed_optimizer_steps < 0 or self.bsa_max_optimizer_steps <= 0:
+        if (
+            self.bsa_completed_optimizer_steps < 0
+            or self.bsa_max_optimizer_steps <= 0
+            or self.bsa_completed_optimizer_steps > self.bsa_max_optimizer_steps
+        ):
             raise ValueError("Invalid BSA optimizer-step progress.")
+        if (
+            self.bsa_compiled_schedule is not None
+            and self.bsa_max_optimizer_steps
+            != self.bsa_compiled_schedule.total_optimizer_steps
+        ):
+            raise ValueError("BSA max_optimizer_steps conflicts with the compiled schedule.")
+
+    def current_bsa_sparsity(self):
+        if not self.enable_bsa:
+            return None
+        if self.bsa_compiled_schedule is None:
+            raise RuntimeError("Runner must initialize the BSA sparsity schedule before forward.")
+        return self.bsa_compiled_schedule.sparsity_at(
+            self.bsa_completed_optimizer_steps
+        )
 
     def current_bsa_context(self):
         if not self.enable_bsa:
             return None
-        if self.bsa_max_optimizer_steps is None:
-            raise RuntimeError("Runner must initialize BSA optimizer-step schedule before forward.")
-        sparsity = bsa_sparsity_for_step(
-            self.bsa_completed_optimizer_steps, self.bsa_max_optimizer_steps
-        )
         return BSAContext.from_config(
             self.bsa_config,
-            sparsity=sparsity,
+            sparsity=self.current_bsa_sparsity(),
             optimizer_step=self.bsa_completed_optimizer_steps,
         )
 
@@ -437,10 +570,9 @@ class WanTrainingModule(DiffusionTrainingModule):
     def bsa_checkpoint_manifest(self):
         if not self.enable_bsa:
             return None
-        current_sparsity = bsa_sparsity_for_step(
-            self.bsa_completed_optimizer_steps,
-            self.bsa_max_optimizer_steps or max(self.bsa_completed_optimizer_steps, 1),
-        )
+        if self.bsa_compiled_schedule is None:
+            raise RuntimeError("Cannot save a BSA checkpoint before schedule initialization.")
+        current_sparsity = self.current_bsa_sparsity()
         current_top_k = None
         try:
             current_top_k = collect_wan_bsa_runtime_info(self.pipe.dit)["top_k"]
@@ -448,6 +580,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             pass
         return bsa_config_manifest(
             self.bsa_config,
+            schema_version=2,
             completed_optimizer_steps=self.bsa_completed_optimizer_steps,
             max_optimizer_steps=self.bsa_max_optimizer_steps,
             current_requested_sparsity=current_sparsity,
@@ -457,6 +590,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             direct_distill_warmstart_sha256=self._wan_bsa_student_info.get(
                 "dense_direct_distill_warmstart_sha256"
             ),
+            **self.bsa_compiled_schedule.to_dict(),
         )
 
     @staticmethod
@@ -489,9 +623,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         lora_grad_norm, lora_nonfinite = self._parameter_group_norm(lora, gradient=True)
         gate_grad_norm, gate_nonfinite = self._parameter_group_norm(gate, gradient=True)
         metrics = {
-            "train/bsa_requested_sparsity": bsa_sparsity_for_step(
-                self.bsa_completed_optimizer_steps, self.bsa_max_optimizer_steps
-            ),
+            "train/bsa_requested_sparsity": self.current_bsa_sparsity(),
             "train/bsa_actual_sparsity": runtime["actual_sparsity"],
             "train/bsa_top_k": runtime["top_k"],
             "train/bsa_num_blocks": runtime["num_blocks"],
@@ -547,8 +679,6 @@ class WanTrainingModule(DiffusionTrainingModule):
         target_top_k = compute_bsa_top_k(
             metadata.num_blocks, self.bsa_config.target_sparsity
         )
-        if tuple(runtime["runtime_grid"]) == (41, 15, 26) and target_top_k != 55:
-            raise RuntimeError(f"Target Wan BSA grid must produce K=55, received {target_top_k}.")
         self._wan_bsa_student_info["expected_runtime_grid"] = self.bsa_expected_runtime_grid
         self._wan_bsa_student_info["target_top_k"] = target_top_k
         self._bsa_runtime_validated = True
@@ -978,6 +1108,14 @@ def wan_parser():
     parser.add_argument("--enable_bsa", action="store_true", help="Enable portable Wan self-attention BSA.")
     parser.add_argument("--bsa_block_size", default="4,3,6", help="3D BSA block as T,H,W.")
     parser.add_argument("--bsa_target_sparsity", type=float, default=0.8)
+    parser.add_argument(
+        "--bsa_sparsity_schedule",
+        default=None,
+        help=(
+            "Versioned BSA schedule preset, inline JSON, or @/absolute/path.json. "
+            "New runs default to legacy_progress_v1; a schema-v2 resume reuses its saved schedule."
+        ),
+    )
     parser.add_argument("--bsa_backend", choices=("sdpa_gather", "eager_math"), default="sdpa_gather")
     parser.add_argument("--bsa_query_block_chunk", type=int, default=4)
     parser.add_argument("--bsa_mask_mode", choices=("additive", "bool"), default="additive")
@@ -1105,6 +1243,7 @@ if __name__ == "__main__":
         direct_distill_target_latent_key=args.direct_distill_target_latent_key,
         enable_bsa=args.enable_bsa,
         bsa_config=build_wan_bsa_config(args),
+        bsa_sparsity_schedule=args.bsa_sparsity_schedule,
         direct_distill_warmstart_lora=args.direct_distill_warmstart_lora,
         resume_bsa_checkpoint=args.resume_bsa_checkpoint,
         bsa_student_info_path=os.path.join(args.output_path, "student_model_info.json")

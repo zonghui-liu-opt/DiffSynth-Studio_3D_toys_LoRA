@@ -19,18 +19,18 @@ from diffsynth.core.attention.block_sparse_attention import (
 
 
 def test_target_geometry_and_valid_count_histogram():
-    metadata = build_bsa_metadata((41, 15, 26), (4, 3, 6), use_cache=False)
+    metadata = build_bsa_metadata((21, 15, 26), (4, 3, 6), use_cache=False)
 
-    assert metadata.block_grid == (11, 5, 5)
-    assert metadata.num_blocks == 275
+    assert metadata.block_grid == (6, 5, 5)
+    assert metadata.num_blocks == 150
     assert metadata.block_capacity == 72
-    assert metadata.padded_grid == (44, 15, 30)
-    assert metadata.sequence_length == 15990
-    assert metadata.padded_tokens == 19800
-    assert compute_bsa_top_k(metadata.num_blocks, 0.8) == 55
-    assert metadata.padding_ratio == pytest.approx(0.1924242424)
+    assert metadata.padded_grid == (24, 15, 30)
+    assert metadata.sequence_length == 8190
+    assert metadata.padded_tokens == 10800
+    assert compute_bsa_top_k(metadata.num_blocks, 0.8) == 30
+    assert metadata.padding_ratio == pytest.approx(0.2416666667)
     values, counts = torch.unique(metadata.valid_count, return_counts=True)
-    assert dict(zip(values.tolist(), counts.tolist())) == {6: 5, 18: 20, 24: 50, 72: 200}
+    assert dict(zip(values.tolist(), counts.tolist())) == {6: 5, 18: 20, 24: 25, 72: 100}
 
 
 def test_pack_unpack_is_reversible_and_uses_w_fastest_order():

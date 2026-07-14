@@ -29,26 +29,41 @@ def load_first_video_frame(path):
         reader.close()
 
 
-def compose_side_by_side(teacher_frames, student_frames):
-    if len(teacher_frames) != len(student_frames) or not teacher_frames:
-        raise ValueError("Teacher and student must contain the same non-zero number of frames.")
+def compose_labeled_panels(panels):
+    """Compose equally sized videos horizontally without re-encoding inputs first."""
+    if not panels:
+        raise ValueError("At least one labeled video panel is required.")
+    labels = [label for label, _ in panels]
+    videos = [frames for _, frames in panels]
+    frame_count = len(videos[0])
+    if frame_count == 0 or any(len(frames) != frame_count for frames in videos):
+        raise ValueError("All video panels must contain the same non-zero number of frames.")
+
     output = []
-    for teacher, student in zip(teacher_frames, student_frames):
-        teacher = teacher.convert("RGB")
-        student = student.convert("RGB")
-        if teacher.size != student.size:
-            raise ValueError("Teacher and student frame sizes must match.")
-        width, height = teacher.size
-        canvas = Image.new("RGB", (width * 2, height), "black")
-        canvas.paste(teacher, (0, 0))
-        canvas.paste(student, (width, 0))
+    for frame_index in range(frame_count):
+        frames = [video[frame_index].convert("RGB") for video in videos]
+        width, height = frames[0].size
+        if any(frame.size != (width, height) for frame in frames[1:]):
+            raise ValueError("All video panel frame sizes must match.")
+        canvas = Image.new("RGB", (width * len(frames), height), "black")
         draw = ImageDraw.Draw(canvas)
-        draw.rectangle((0, 0, 130, 24), fill="black")
-        draw.rectangle((width, 0, width + 130, 24), fill="black")
-        draw.text((6, 5), "Teacher 50-step", fill="white")
-        draw.text((width + 6, 5), "Student 4-step", fill="white")
+        for panel_index, (label, frame) in enumerate(zip(labels, frames)):
+            x = panel_index * width
+            canvas.paste(frame, (x, 0))
+            label_width = min(width, max(130, 12 + 7 * len(label)))
+            draw.rectangle((x, 0, x + label_width, 24), fill="black")
+            draw.text((x + 6, 5), label, fill="white")
         output.append(canvas)
     return output
+
+
+def compose_side_by_side(teacher_frames, student_frames):
+    return compose_labeled_panels(
+        [
+            ("Teacher 50-step", teacher_frames),
+            ("Student 4-step", student_frames),
+        ]
+    )
 
 
 def _resolve_metadata_path(value, base_path):

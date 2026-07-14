@@ -153,6 +153,17 @@ def advance_completed_optimizer_steps(completed_steps, *, sync_gradients, step_w
     return completed_steps + int(bool(sync_gradients) and not bool(step_was_skipped))
 
 
+def optimizer_steps_per_epoch(num_batches, gradient_accumulation_steps):
+    """Count optimizer updates after Accelerate flushes accumulation each epoch."""
+    for name, value in (
+        ("num_batches", num_batches),
+        ("gradient_accumulation_steps", gradient_accumulation_steps),
+    ):
+        if isinstance(value, bool) or int(value) != value or int(value) <= 0:
+            raise ValueError(f"{name} must be a positive integer, received {value!r}.")
+    return math.ceil(int(num_batches) / int(gradient_accumulation_steps))
+
+
 def save_training_args(args):
     output_path = getattr(args, "output_path", None) if args is not None else None
     if output_path is None:
@@ -229,22 +240,28 @@ def launch_training_task(
     initialize_deepspeed_gradient_checkpointing(accelerator)
     unwrapped_model = accelerator.unwrap_model(model)
     if getattr(unwrapped_model, "enable_bsa", False):
-        estimated_optimizer_steps = math.ceil(
-            len(dataloader) * num_epochs / accelerator.gradient_accumulation_steps
+        steps_per_epoch = optimizer_steps_per_epoch(
+            len(dataloader), accelerator.gradient_accumulation_steps
         )
-        resume_manifest = getattr(unwrapped_model, "bsa_resume_manifest", None)
-        schedule_steps = (
-            int(resume_manifest["max_optimizer_steps"])
-            if isinstance(resume_manifest, dict) and resume_manifest.get("max_optimizer_steps")
-            else estimated_optimizer_steps
+        compiled_schedule = unwrapped_model.initialize_bsa_training_schedule(
+            steps_per_epoch=steps_per_epoch,
+            total_epochs=num_epochs,
         )
-        unwrapped_model.set_bsa_training_progress(
-            unwrapped_model.bsa_completed_optimizer_steps, schedule_steps
-        )
+        schedule_steps = compiled_schedule.total_optimizer_steps
         if schedule_steps < 1500 and accelerator.is_main_process:
             print(
                 f"Warning: BSA schedule has only {schedule_steps} optimizer steps; "
                 "the first formal experiment should use at least 3000."
+            )
+        if accelerator.is_main_process:
+            runtime = compiled_schedule.to_dict()["schedule_runtime"]
+            print(
+                "BSA sparsity schedule: "
+                f"steps_per_epoch={runtime['steps_per_epoch']}, "
+                f"total_epochs={runtime['planned_total_epochs']}, "
+                f"total_optimizer_steps={runtime['planned_total_optimizer_steps']}, "
+                f"transition_steps={runtime['transition_steps']}, "
+                f"sparsities={runtime['sparsities']}."
             )
     if getattr(unwrapped_model, "enable_bsa", False):
         unwrapped_model.probe_bsa_backend(accelerator.device)
@@ -261,8 +278,16 @@ def launch_training_task(
     bsa_optimizer_info_written = False
     accumulated_statistics = _empty_training_step_statistics()
     loss_ema = getattr(unwrapped_model, "bsa_loss_ema", None)
+    bsa_training_complete = False
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
+            if (
+                getattr(unwrapped_model, "enable_bsa", False)
+                and unwrapped_model.bsa_completed_optimizer_steps
+                >= unwrapped_model.bsa_max_optimizer_steps
+            ):
+                bsa_training_complete = True
+                break
             if enable_training_metrics:
                 if accumulated_statistics["loss_weight"] == 0 and accelerator.device.type == "cuda" and torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats(accelerator.device)
@@ -454,6 +479,8 @@ def launch_training_task(
                     # Preserve the upstream micro-batch logging/checkpoint cadence unless
                     # the explicit DirectDistill metrics mode is enabled.
                     model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+        if bsa_training_complete:
+            break
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 

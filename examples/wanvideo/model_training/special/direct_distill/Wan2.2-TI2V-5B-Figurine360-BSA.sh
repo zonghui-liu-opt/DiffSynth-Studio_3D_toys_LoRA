@@ -11,16 +11,20 @@ TOKENIZER_PATH="${TOKENIZER_PATH:-/path/to/google/umt5-xxl}"
 FIGURINE360_LORA="${FIGURINE360_LORA:-/path/to/figurine360.safetensors}"
 DENSE_WARMSTART_LORA="${DENSE_WARMSTART_LORA:-/path/to/dense-direct-distill.safetensors}"
 SMOKE_TEACHER_ROOT="${SMOKE_TEACHER_ROOT:-${REPO_ROOT}/outputs/direct_distill_smoke_teacher}"
-TEACHER_ROOT="${TEACHER_ROOT:-${REPO_ROOT}/outputs/direct_distill_teacher}"
+TEACHER_ROOT="${TEACHER_ROOT:-${REPO_ROOT}/outputs/direct_distill_teacher_bsa_h480_w832_f81}"
 BSA_SMOKE_OUTPUT="${BSA_SMOKE_OUTPUT:-${REPO_ROOT}/outputs/bsa_direct_distill_smoke}"
 BSA_TRAIN_OUTPUT="${BSA_TRAIN_OUTPUT:-${REPO_ROOT}/outputs/bsa_direct_distill_train}"
 BSA_VALIDATION_OUTPUT="${BSA_VALIDATION_OUTPUT:-${REPO_ROOT}/outputs/bsa_direct_distill_validation}"
 BSA_CHECKPOINT="${BSA_CHECKPOINT:-}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-}"
+NUM_PROCESSES="${NUM_PROCESSES:-}"
+MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-}"
 # ============================================================================
 
 BSA_BLOCK_SIZE="${BSA_BLOCK_SIZE:-4,3,6}"
 BSA_TARGET_SPARSITY="${BSA_TARGET_SPARSITY:-0.8}"
+BSA_SPARSITY_SCHEDULE="${BSA_SPARSITY_SCHEDULE:-conservative_epoch_v1}"
+BSA_SMOKE_SPARSITY_SCHEDULE="${BSA_SMOKE_SPARSITY_SCHEDULE:-legacy_progress_v1}"
 BSA_BACKEND="${BSA_BACKEND:-sdpa_gather}"
 BSA_QUERY_BLOCK_CHUNK="${BSA_QUERY_BLOCK_CHUNK:-4}"
 BSA_QUERY_BLOCK_CHUNK_CANDIDATES="${BSA_QUERY_BLOCK_CHUNK_CANDIDATES:-4,8,16,32}"
@@ -32,13 +36,13 @@ DIRECT_DISTILL_LR="${DIRECT_DISTILL_LR:-2e-6}"
 DENSE_ANCHOR_WEIGHT="${DENSE_ANCHOR_WEIGHT:-0.0}"
 DENSE_ANCHOR_INTERVAL="${DENSE_ANCHOR_INTERVAL:-2}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-# 4卡、单seed=1、约721条源数据时约产生3.9k-4.3k个真实optimizer steps。
-NUM_EPOCHS="${NUM_EPOCHS:-24}"
+# 6卡、batch=1/rank、GA=1、721条训练数据时为121 steps/epoch、总计7260步。
+NUM_EPOCHS="${NUM_EPOCHS:-60}"
 SMOKE_EPOCHS="${SMOKE_EPOCHS:-2}"
 DATASET_REPEAT="${DATASET_REPEAT:-1}"
 SAVE_STEPS="${SAVE_STEPS:-200}"
-FORMAL_HEIGHT="${FORMAL_HEIGHT:-832}"
-FORMAL_WIDTH="${FORMAL_WIDTH:-480}"
+FORMAL_HEIGHT="${FORMAL_HEIGHT:-480}"
+FORMAL_WIDTH="${FORMAL_WIDTH:-832}"
 FORMAL_NUM_FRAMES="${FORMAL_NUM_FRAMES:-81}"
 SMOKE_HEIGHT="${SMOKE_HEIGHT:-256}"
 SMOKE_WIDTH="${SMOKE_WIDTH:-448}"
@@ -60,12 +64,15 @@ require_dir() { [[ -d "$1" ]] || die "$2不存在: $1"; }
 
 require_seed_one_metadata() {
   local metadata="$1"
-  python3 - "${metadata}" <<'PY'
+  local expected_height="${2:-}" expected_width="${3:-}" expected_frames="${4:-}" base_path="${5:-}"
+  python3 - "${metadata}" "${expected_height}" "${expected_width}" "${expected_frames}" "${base_path}" <<'PY'
 import csv
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
+expected_shape = tuple(int(value) for value in sys.argv[2:5]) if sys.argv[2] else None
+base_path = pathlib.Path(sys.argv[5]) if sys.argv[5] else None
 with path.open("r", encoding="utf-8-sig", newline="") as file:
     reader = csv.DictReader(file)
     if "seed" not in (reader.fieldnames or []):
@@ -77,6 +84,34 @@ if not rows:
 invalid = sorted({(row.get("seed") or "").strip() for row in rows if (row.get("seed") or "").strip() != "1"})
 if invalid:
     raise SystemExit(f"BSA训练/验证只允许seed=1，发现: {invalid[:8]}")
+if expected_shape is not None:
+    required = {"height", "width", "num_frames", "input_image", "teacher_latent"}
+    missing = sorted(required.difference(reader.fieldnames or []))
+    if missing:
+        raise SystemExit(f"metadata缺少正式训练字段: {missing}")
+    invalid_shape = []
+    missing_files = []
+    for row_id, row in enumerate(rows, start=2):
+        try:
+            actual_shape = tuple(int(row[key]) for key in ("height", "width", "num_frames"))
+        except (TypeError, ValueError):
+            actual_shape = None
+        if actual_shape != expected_shape:
+            invalid_shape.append((row_id, actual_shape))
+        for key in ("input_image", "teacher_latent"):
+            value = (row.get(key) or "").strip()
+            item = pathlib.Path(value)
+            if not item.is_absolute() and base_path is not None:
+                item = base_path / item
+            if not value or not item.is_file():
+                missing_files.append((row_id, key, value))
+    if invalid_shape:
+        raise SystemExit(
+            f"metadata shape必须全部为height,width,num_frames={expected_shape}，"
+            f"发现: {invalid_shape[:8]}"
+        )
+    if missing_files:
+        raise SystemExit(f"metadata引用文件不存在: {missing_files[:8]}")
 print(f"seed=1 metadata检查通过: {len(rows)}条")
 PY
 }
@@ -95,11 +130,24 @@ model_path_args() {
 }
 
 accelerate_prefix() {
+  local command=(accelerate launch)
   if [[ -n "${ACCELERATE_CONFIG}" ]]; then
-    printf '%s\0' accelerate launch --config_file "${ACCELERATE_CONFIG}"
-  else
-    printf '%s\0' accelerate launch
+    command+=(--config_file "${ACCELERATE_CONFIG}")
+  elif [[ -n "${NUM_PROCESSES}" && "${NUM_PROCESSES}" -gt 1 ]]; then
+    command+=(--multi_gpu)
   fi
+  [[ -z "${NUM_PROCESSES}" ]] || command+=(--num_processes "${NUM_PROCESSES}")
+  [[ -z "${MAIN_PROCESS_PORT}" ]] || command+=(--main_process_port "${MAIN_PROCESS_PORT}")
+  printf '%s\0' "${command[@]}"
+}
+
+wan22_expected_grid() {
+  local height="$1" width="$2" frames="$3"
+  [[ "${height}" =~ ^[1-9][0-9]*$ && "${width}" =~ ^[1-9][0-9]*$ && "${frames}" =~ ^[1-9][0-9]*$ ]] \
+    || die "height/width/num_frames必须是正整数"
+  (( height % 32 == 0 && width % 32 == 0 && (frames - 1) % 4 == 0 )) \
+    || die "Wan2.2 BSA要求height/width可被32整除且num_frames=4n+1"
+  printf '%s,%s,%s' "$(( (frames - 1) / 4 + 1 ))" "$(( height / 32 ))" "$(( width / 32 ))"
 }
 
 doctor() {
@@ -114,17 +162,20 @@ doctor() {
   require_file "${VALIDATE_PY}" "BSA验证脚本"
   require_file "${BENCHMARK_PY}" "BSA benchmark脚本"
   [[ -z "${ACCELERATE_CONFIG}" ]] || require_file "${ACCELERATE_CONFIG}" "Accelerate配置"
+  [[ -z "${NUM_PROCESSES}" || "${NUM_PROCESSES}" =~ ^[1-9][0-9]*$ ]] || die "NUM_PROCESSES必须是正整数"
+  [[ -z "${MAIN_PROCESS_PORT}" || "${MAIN_PROCESS_PORT}" =~ ^[1-9][0-9]*$ ]] || die "MAIN_PROCESS_PORT必须是正整数"
   python3 -c 'import accelerate,diffsynth,imageio,imageio_ffmpeg,matplotlib,peft,PIL,safetensors,torch; print("依赖检查通过")'
   echo "本地路径与依赖检查通过；不会下载模型。"
 }
 
 train_bsa() {
   local teacher_root="$1" output="$2" height="$3" width="$4" frames="$5" epochs="$6"
-  local expected_grid="${7:-}"
+  local schedule="$7" expected_grid
+  expected_grid="$(wan22_expected_grid "${height}" "${width}" "${frames}")"
   doctor
   local metadata="${teacher_root}/metadata_direct_distill_train.csv"
   require_file "${metadata}" "DirectDistill训练metadata"
-  require_seed_one_metadata "${metadata}"
+  require_seed_one_metadata "${metadata}" "${height}" "${width}" "${frames}" "${teacher_root}"
   [[ ! -e "${output}" ]] || die "输出路径已存在，请使用新目录: ${output}"
   local launch=()
   while IFS= read -r -d '' item; do launch+=("${item}"); done < <(accelerate_prefix)
@@ -153,13 +204,16 @@ train_bsa() {
     --bsa_gate_rank 32 --bsa_gate_alpha 32 --bsa_trainable_dtype fp32
     --bsa_dense_anchor_weight "${DENSE_ANCHOR_WEIGHT}" --bsa_dense_anchor_interval "${DENSE_ANCHOR_INTERVAL}"
   )
-  [[ -z "${expected_grid}" ]] || command+=(--bsa_expected_runtime_grid "${expected_grid}")
+  command+=(--bsa_expected_runtime_grid "${expected_grid}")
   [[ "${BSA_COUNT_BIAS}" != 1 ]] || command+=(--bsa_ragged_count_bias)
   if [[ -n "${BSA_CHECKPOINT}" ]]; then
     require_file "${BSA_CHECKPOINT}/checkpoint_complete" "组合checkpoint完成标记"
     command+=(--resume_bsa_checkpoint "${BSA_CHECKPOINT}")
   else
-    command+=(--direct_distill_warmstart_lora "${DENSE_WARMSTART_LORA}")
+    command+=(
+      --bsa_sparsity_schedule "${schedule}"
+      --direct_distill_warmstart_lora "${DENSE_WARMSTART_LORA}"
+    )
   fi
   "${command[@]}"
 }
@@ -170,7 +224,7 @@ validate_bsa() {
   require_file "${BSA_CHECKPOINT}/checkpoint_complete" "组合checkpoint完成标记"
   local metadata="${TEACHER_ROOT}/metadata_direct_distill_validation.csv"
   require_file "${metadata}" "验证metadata"
-  require_seed_one_metadata "${metadata}"
+  require_seed_one_metadata "${metadata}" "${FORMAL_HEIGHT}" "${FORMAL_WIDTH}" "${FORMAL_NUM_FRAMES}" "${TEACHER_ROOT}"
   local model_args=()
   while IFS= read -r -d '' item; do model_args+=("${item}"); done < <(model_path_args)
   python3 "${VALIDATE_PY}" "${model_args[@]}" \
@@ -194,8 +248,9 @@ usage() {
 用法: Wan2.2-TI2V-5B-Figurine360-BSA.sh COMMAND
 
   doctor           检查离线路径与依赖
-  bsa-smoke-train  使用已有smoke teacher latent做短训练
-  bsa-train        使用正式teacher latent做联合训练
+  bsa-smoke-train  使用已有smoke teacher latent和legacy短调度做链路测试
+  train            使用正式teacher latent和保守调度做联合训练（与bsa-train完全等价）
+  bsa-train        train的兼容别名
   bsa-validate     输出teacher/A dense warm-start/B joint-dense/C joint-sparse
   bsa-benchmark    独立子进程单层预筛；不能替代完整4-step optimizer benchmark
   plot             绘制BSA训练metrics.jsonl
@@ -204,8 +259,8 @@ EOF
 
 case "${1:-}" in
   doctor) doctor ;;
-  bsa-smoke-train) train_bsa "${SMOKE_TEACHER_ROOT}" "${BSA_SMOKE_OUTPUT}" "${SMOKE_HEIGHT}" "${SMOKE_WIDTH}" "${SMOKE_NUM_FRAMES}" "${SMOKE_EPOCHS}" ;;
-  bsa-train) train_bsa "${TEACHER_ROOT}" "${BSA_TRAIN_OUTPUT}" "${FORMAL_HEIGHT}" "${FORMAL_WIDTH}" "${FORMAL_NUM_FRAMES}" "${NUM_EPOCHS}" 41,15,26 ;;
+  bsa-smoke-train) train_bsa "${SMOKE_TEACHER_ROOT}" "${BSA_SMOKE_OUTPUT}" "${SMOKE_HEIGHT}" "${SMOKE_WIDTH}" "${SMOKE_NUM_FRAMES}" "${SMOKE_EPOCHS}" "${BSA_SMOKE_SPARSITY_SCHEDULE}" ;;
+  train|bsa-train) train_bsa "${TEACHER_ROOT}" "${BSA_TRAIN_OUTPUT}" "${FORMAL_HEIGHT}" "${FORMAL_WIDTH}" "${FORMAL_NUM_FRAMES}" "${NUM_EPOCHS}" "${BSA_SPARSITY_SCHEDULE}" ;;
   bsa-validate) validate_bsa ;;
   bsa-benchmark) benchmark_bsa ;;
   plot) require_file "${BSA_TRAIN_OUTPUT}/metrics.jsonl" "BSA指标"; python3 "${PLOT_PY}" "${BSA_TRAIN_OUTPUT}/metrics.jsonl" --output-dir "${BSA_TRAIN_OUTPUT}/plots" ;;

@@ -29,6 +29,47 @@ def test_compose_side_by_side_rejects_mismatch():
         MODULE.compose_side_by_side([Image.new("RGB", (4, 4))], [])
 
 
+def test_compose_labeled_panels_supports_three_videos():
+    panels = [
+        (label, [Image.new("RGB", (12, 8), color) for _ in range(2)])
+        for label, color in (
+            ("Teacher 50-step", "red"),
+            ("Student 4-step", "blue"),
+            ("Student BSA 4-step", "green"),
+        )
+    ]
+
+    combined = MODULE.compose_labeled_panels(panels)
+
+    assert len(combined) == 2
+    assert combined[0].size == (36, 8)
+
+
+@pytest.mark.parametrize(
+    "panels, message",
+    [
+        ([], "At least one"),
+        (
+            [
+                ("one", [Image.new("RGB", (4, 4))]),
+                ("two", []),
+            ],
+            "same non-zero",
+        ),
+        (
+            [
+                ("one", [Image.new("RGB", (4, 4))]),
+                ("two", [Image.new("RGB", (5, 4))]),
+            ],
+            "frame sizes",
+        ),
+    ],
+)
+def test_compose_labeled_panels_rejects_invalid_inputs(panels, message):
+    with pytest.raises(ValueError, match=message):
+        MODULE.compose_labeled_panels(panels)
+
+
 def test_metadata_prefers_cached_input_image(tmp_path):
     image_path = tmp_path / "first.png"
     Image.new("RGB", (9, 7), "green").save(image_path)

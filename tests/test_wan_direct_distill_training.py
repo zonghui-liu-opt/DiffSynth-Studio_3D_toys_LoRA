@@ -6,6 +6,12 @@ import torch
 from accelerate.utils import send_to_device
 from PIL import Image
 from safetensors.torch import save_file
+from diffsynth.diffusion.bsa_schedule import (
+    compile_bsa_schedule,
+    compiled_bsa_schedule_from_dict,
+    load_bsa_schedule,
+)
+from diffsynth.models.wan_video_bsa import WanBSAConfig
 
 from examples.wanvideo.model_training.train import (
     DIRECT_DISTILL_LATENT_METADATA_KEY,
@@ -104,16 +110,115 @@ def test_wan_parser_exposes_strict_direct_distill_options():
         "--direct_distill_target_latent_key", "input_latents",
         "--enable_direct_distill_metrics",
         "--direct_distill_loss_ema_beta", "0.9",
+        "--bsa_sparsity_schedule", "conservative_epoch_v1",
     ])
     assert args.direct_distill_preserve_first_frame is True
     assert args.direct_distill_exclude_first_frame_loss is True
     assert args.direct_distill_target_latent_key == "input_latents"
     assert args.enable_direct_distill_metrics is True
     assert args.direct_distill_loss_ema_beta == pytest.approx(0.9)
+    assert args.bsa_sparsity_schedule == "conservative_epoch_v1"
 
     defaults = wan_parser().parse_args(["--dataset_base_path", "dataset"])
     assert defaults.enable_direct_distill_metrics is False
     assert defaults.direct_distill_loss_ema_beta == pytest.approx(0.98)
+    assert defaults.bsa_sparsity_schedule is None
+
+
+def _make_bsa_schedule_module(schedule=None, resume_manifest=None):
+    module = WanTrainingModule.__new__(WanTrainingModule)
+    torch.nn.Module.__init__(module)
+    module.enable_bsa = True
+    module.bsa_config = WanBSAConfig(backend="eager_math")
+    module.bsa_requested_schedule_spec = (
+        load_bsa_schedule(schedule) if schedule is not None else None
+    )
+    module.bsa_schedule_spec = (
+        module.bsa_requested_schedule_spec or load_bsa_schedule("legacy_progress_v1")
+    )
+    module.bsa_resume_manifest = resume_manifest
+    module._bsa_resume_compiled_schedule = None
+    if resume_manifest is not None and resume_manifest["schema_version"] == 2:
+        module._bsa_resume_compiled_schedule = compiled_bsa_schedule_from_dict(
+            resume_manifest, target_sparsity=module.bsa_config.target_sparsity
+        )
+        module.bsa_schedule_spec = module._bsa_resume_compiled_schedule.spec
+    module.bsa_compiled_schedule = None
+    module.bsa_completed_optimizer_steps = int(
+        (resume_manifest or {}).get("completed_optimizer_steps", 0)
+    )
+    module.bsa_max_optimizer_steps = None
+    module.bsa_loss_ema = None
+    module._wan_bsa_student_info = {}
+    module.pipe = SimpleNamespace(dit=SimpleNamespace(blocks=[]))
+    return module
+
+
+def test_bsa_schedule_initialization_has_one_source_for_context_and_manifest():
+    module = _make_bsa_schedule_module("conservative_epoch_v1")
+    compiled = module.initialize_bsa_training_schedule(steps_per_epoch=121, total_epochs=60)
+
+    assert compiled.transition_steps == (363, 484, 605, 726, 847, 968, 1089, 1210, 1331)
+    module.set_bsa_training_progress(363, compiled.total_optimizer_steps)
+    assert module.current_bsa_sparsity() == 0.1
+    assert module.current_bsa_context().sparsity == 0.1
+    manifest = module.bsa_checkpoint_manifest()
+    assert manifest["schema_version"] == 2
+    assert manifest["current_requested_sparsity"] == 0.1
+    assert manifest["schedule_sha256"] == compiled.spec_sha256
+
+
+def test_bsa_schema_v2_resume_rejects_schedule_or_geometry_changes():
+    saved = compile_bsa_schedule(
+        "conservative_epoch_v1",
+        steps_per_epoch=121,
+        total_epochs=60,
+        target_sparsity=0.8,
+    )
+    manifest = {
+        "schema_version": 2,
+        "completed_optimizer_steps": 200,
+        **saved.to_dict(),
+    }
+    resumed = _make_bsa_schedule_module("conservative_epoch_v1", manifest)
+    assert resumed.initialize_bsa_training_schedule(121, 60) == saved
+
+    changed_geometry = _make_bsa_schedule_module("conservative_epoch_v1", manifest)
+    with pytest.raises(ValueError, match="training geometry conflicts"):
+        changed_geometry.initialize_bsa_training_schedule(122, 60)
+
+    changed_schedule = _make_bsa_schedule_module("mature_same_shape_v1", manifest)
+    with pytest.raises(ValueError, match="schedule conflicts"):
+        changed_schedule.initialize_bsa_training_schedule(121, 60)
+
+    mature = compile_bsa_schedule(
+        "mature_same_shape_v1",
+        steps_per_epoch=121,
+        total_epochs=60,
+        target_sparsity=0.8,
+    )
+    mature_manifest = {
+        "schema_version": 2,
+        "completed_optimizer_steps": 200,
+        **mature.to_dict(),
+    }
+    automatic = _make_bsa_schedule_module(None, mature_manifest)
+    assert automatic.initialize_bsa_training_schedule(121, 60) == mature
+
+
+def test_bsa_schema_v1_resume_is_pinned_to_legacy_schedule():
+    manifest = {
+        "schema_version": 1,
+        "completed_optimizer_steps": 200,
+        "max_optimizer_steps": 7260,
+    }
+    resumed = _make_bsa_schedule_module(None, manifest)
+    compiled = resumed.initialize_bsa_training_schedule(121, 60)
+    assert compiled.transition_steps == (363, 726, 1089, 1452, 1815, 2178, 2541, 2904)
+
+    changed = _make_bsa_schedule_module("conservative_epoch_v1", manifest)
+    with pytest.raises(ValueError, match="require.*legacy_progress_v1"):
+        changed.initialize_bsa_training_schedule(121, 60)
 
 
 def test_metrics_cli_is_wired_to_model_logger_jsonl(tmp_path):

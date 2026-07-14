@@ -30,7 +30,7 @@ CPU独立子进程benchmark smoke                         passed（非H100结论
 ## Stage B 必验
 
 1. 真实模型严格 30/30 注入、warm-start key 全覆盖、FP32 trainable/Adam state；
-2. target grid `(41,15,26)` 的 s=0 parity 与 K55 runtime 摘要；
+2. 81 帧正式配置的 target grid `(21,15,26)` 的 s=0 parity 与 K30 runtime 摘要；
 3. 2–10 step loss/gradient/checkpoint smoke，随后 50-step 显存无泄漏；
 4. 各 K bucket 的完整 4-step optimizer benchmark 和实际 SDPA kernel；
 5. 至少 12 个、最好 50 个 held-out 的 teacher/A/B/C 质量评测；
