@@ -68,3 +68,4 @@ class GeneralLoRALoader:
                 module.load_state_dict(state_dict_base)
                 updated_num += 1
         print(f"{updated_num} tensors are fused by LoRA. Fused LoRA layers cannot be cleared by `pipe.clear_lora()`.")
+        return updated_num
